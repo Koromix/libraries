@@ -2355,6 +2355,7 @@ int _hs_open_file_port(hs_device *dev, hs_port_mode mode, hs_port **rport)
     port->path = dev->path;
     port->dev = hs_device_ref(dev);
 
+    access = UINT32_MAX;
     switch (mode) {
     case HS_PORT_MODE_READ:
         access = GENERIC_READ;
@@ -2366,9 +2367,10 @@ int _hs_open_file_port(hs_device *dev, hs_port_mode mode, hs_port **rport)
         access = GENERIC_READ | GENERIC_WRITE;
         break;
     }
+    assert(access != UINT32_MAX);
 
     port->u.handle.h = CreateFile(dev->path, access, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                               NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+                                  NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
     if (port->u.handle.h == INVALID_HANDLE_VALUE) {
         switch (GetLastError()) {
         case ERROR_FILE_NOT_FOUND:
@@ -4260,10 +4262,10 @@ int hs_monitor_refresh(hs_monitor *monitor, hs_enumerate_func *f, void *udata)
         r = monitor->thread_ret;
         monitor->thread_ret = 0;
         LeaveCriticalSection(&monitor->events_lock);
-    }
 
-    if (r < 0)
-        goto cleanup;
+        if (r < 0)
+            goto cleanup;
+    }
 
     for (; event_idx < monitor->refresh_events.count; event_idx++) {
         struct event *event = &monitor->refresh_events.values[event_idx];
@@ -4273,18 +4275,16 @@ int hs_monitor_refresh(hs_monitor *monitor, hs_enumerate_func *f, void *udata)
             hs_log(HS_LOG_DEBUG, "Received arrival notification for device '%s'",
                    event->device_key);
             r = process_arrival_event(monitor, event->device_key, f, udata);
+            if (r)
+                goto cleanup;
             break;
 
         case DEVICE_EVENT_REMOVED:
             hs_log(HS_LOG_DEBUG, "Received removal notification for device '%s'",
                    event->device_key);
             _hs_monitor_remove(&monitor->devices, event->device_key, f, udata);
-            r = 0;
             break;
         }
-
-        if (r)
-            goto cleanup;
     }
 
     r = 0;
