@@ -23,7 +23,7 @@
    ------------------- | --------------------------------------------------------------------------------
    Windows (MSVC)      | Nothing to do, libhs uses `#pragma comment(lib)`
    Windows (MinGW-w64) | Link _user32, advapi32, setupapi and hid_ `-luser32 -ladvapi32 -lsetupapi -lhid`
-   OSX (Clang)         | Link _CoreFoundation and IOKit_
+   OSX (Clang)         | Link _CoreFoundation and IOKit_ `-framework CoreFoundation -framework IOKit`
    Linux (GCC)         | Link _libudev_ `-ludev`
 
    Other systems are not supported at the moment. */
@@ -87,16 +87,12 @@ typedef struct hs_match hs_match;
 #define HS_VERSION_STRING "0.9.0"
 
 #if defined(__GNUC__)
-    #define HS_PUBLIC __attribute__((__visibility__("default")))
-
     #ifdef __MINGW_PRINTF_FORMAT
         #define HS_PRINTF_FORMAT(fmt, first) __attribute__((__format__(__MINGW_PRINTF_FORMAT, fmt, first)))
     #else
         #define HS_PRINTF_FORMAT(fmt, first) __attribute__((__format__(__printf__, fmt, first)))
     #endif
 #elif _MSC_VER >= 1900
-    #define HS_PUBLIC
-
     #define HS_PRINTF_FORMAT(fmt, first)
 
     // HAVE_SSIZE_T is used this way by other projects
@@ -112,7 +108,11 @@ typedef long ssize_t;
     #error "This compiler is not supported"
 #endif
 
+#define _HS_CONCAT_HELPER(a, b) a ## b
+#define _HS_CONCAT(a, b) _HS_CONCAT_HELPER(a, b)
+
 #define _HS_UNIQUE_ID(prefix) _HS_CONCAT(prefix, __LINE__)
+
 #define _hs_container_of(head, type, member) \
     ((type *)((char *)(head) - (size_t)(&((type *)0)->member)))
 
@@ -184,7 +184,7 @@ typedef void hs_log_handler_func(hs_log_level level, int err, const char *msg, v
  * @sa HS_VERSION for the compile-time version.
  * @sa hs_version_string() for the version string.
  */
-HS_PUBLIC uint32_t hs_version(void);
+uint32_t hs_version(void);
 /**
  * @ingroup misc
  * @brief Run-time libhs version string.
@@ -194,7 +194,7 @@ HS_PUBLIC uint32_t hs_version(void);
  * @sa HS_VERSION_STRING for the compile-time version.
  * @sa hs_version() for the version number.
  */
-HS_PUBLIC const char *hs_version_string(void);
+const char *hs_version_string(void);
 
 /** @} */
 
@@ -207,7 +207,7 @@ HS_PUBLIC const char *hs_version_string(void);
  * @ingroup misc
  * @brief Default log handler, see hs_log_set_handler() for more information.
  */
-HS_PUBLIC void hs_log_default_handler(hs_log_level level, int err, const char *msg, void *udata);
+void hs_log_default_handler(hs_log_level level, int err, const char *msg, void *udata);
 /**
  * @ingroup misc
  * @brief Change the log handler function.
@@ -221,7 +221,7 @@ HS_PUBLIC void hs_log_default_handler(hs_log_level level, int err, const char *m
  * @sa hs_log()
  * @sa hs_log_default_handler() is the default log handler.
  */
-HS_PUBLIC void hs_log_set_handler(hs_log_handler_func *f, void *udata);
+void hs_log_set_handler(hs_log_handler_func *f, void *udata);
 /**
  * @ingroup misc
  * @brief Call the log callback with a printf-formatted message.
@@ -236,7 +236,7 @@ HS_PUBLIC void hs_log_set_handler(hs_log_handler_func *f, void *udata);
  *
  * @sa hs_log_set_handler() to use a custom callback function.
  */
-HS_PUBLIC void hs_log(hs_log_level level, const char *fmt, ...) HS_PRINTF_FORMAT(2, 3);
+void hs_log(hs_log_level level, const char *fmt, ...) HS_PRINTF_FORMAT(2, 3);
 
 /** @} */
 
@@ -269,14 +269,14 @@ HS_PUBLIC void hs_log(hs_log_level level, const char *fmt, ...) HS_PRINTF_FORMAT
  * @sa hs_error_unmask()
  * @sa hs_error_is_masked()
  */
-HS_PUBLIC void hs_error_mask(hs_error_code err);
+void hs_error_mask(hs_error_code err);
 /**
  * @ingroup misc
  * @brief Unmask the last masked error code.
  *
  * @sa hs_error_mask()
  */
-HS_PUBLIC void hs_error_unmask(void);
+void hs_error_unmask(void);
 /**
  * @ingroup misc
  * @brief Check whether an error code is masked.
@@ -290,13 +290,13 @@ HS_PUBLIC void hs_error_unmask(void);
  *
  * @sa hs_error_mask()
  */
-HS_PUBLIC int hs_error_is_masked(int err);
+int hs_error_is_masked(int err);
 
 /**
   * @ingroup misc
   * @brief Get the last error message emitted on the current thread.
   */
-HS_PUBLIC const char *hs_error_last_message();
+const char *hs_error_last_message();
 
 /**
  * @ingroup misc
@@ -327,7 +327,74 @@ HS_PUBLIC const char *hs_error_last_message();
  * @sa hs_error_mask() to mask specific error codes.
  * @sa hs_log_set_handler() to use a custom callback function.
  */
-HS_PUBLIC int hs_error(hs_error_code err, const char *fmt, ...) HS_PRINTF_FORMAT(2, 3);
+int hs_error(hs_error_code err, const char *fmt, ...) HS_PRINTF_FORMAT(2, 3);
+
+HS_END_C
+
+#endif
+
+// array.h
+// ------------------------------------
+
+#ifndef HS_ARRAY_H
+#define HS_ARRAY_H
+
+// #include "common.h"
+
+HS_BEGIN_C
+
+struct _hs_array {
+    void *values;
+    size_t allocated;
+    size_t count;
+};
+
+#define _HS_ARRAY(Type) \
+    struct { \
+        Type *values; \
+        size_t allocated; \
+        size_t count; \
+    }
+
+#define _hs_array_release(Array) \
+    _hs_array_release_((struct _hs_array *)&(Array)->values)
+
+#define _hs_array_grow(Array, Need) \
+    _hs_array_grow_((struct _hs_array *)&(Array)->values, sizeof(*(Array)->values), (Need))
+#define _hs_array_push(Array, Value) \
+    (_hs_array_grow((Array), 1) < 0 \
+        ? HS_ERROR_MEMORY \
+        : (((Array)->values[(Array)->count++] = (Value)), 0))
+
+#define _hs_array_shrink(Array) \
+    _hs_array_shrink_((struct _hs_array *)&(Array)->values, sizeof(*(Array)->values))
+#define _hs_array_pop(Array, Count) \
+    do { \
+        (Array)->count -= (Count); \
+        if ((Array)->count <= (Array)->allocated / 2) \
+            _hs_array_shrink(Array); \
+    } while (0)
+#define _hs_array_deque(Array, Count) \
+    do { \
+        size_t _HS_UNIQUE_ID(count) = (Count); \
+        memmove((Array)->values, (Array)->values + _HS_UNIQUE_ID(count), \
+                ((Array)->count - _HS_UNIQUE_ID(count)) * sizeof(*(Array)->values)); \
+        _hs_array_pop((Array), _HS_UNIQUE_ID(count)); \
+    } while (0)
+
+void _hs_array_release_(struct _hs_array *array);
+
+int _hs_array_expand_(struct _hs_array *array, size_t value_size, size_t need);
+static inline int _hs_array_grow_(struct _hs_array *array, size_t value_size, size_t need)
+{
+    if (need > array->allocated - array->count) {
+        return _hs_array_expand_(array, value_size, need);
+    } else {
+        return 0;
+    }
+}
+
+void _hs_array_shrink_(struct _hs_array *array, size_t value_size);
 
 HS_END_C
 
@@ -340,6 +407,8 @@ HS_END_C
 #define HS_HTABLE_H
 
 // #include "common.h"
+
+HS_BEGIN_C
 
 typedef struct _hs_htable_head {
     // Keep first!
@@ -391,101 +460,7 @@ static inline uint32_t _hs_htable_hash_ptr(const void *p)
              cur != _HS_UNIQUE_ID(head); cur = _HS_UNIQUE_ID(next), _HS_UNIQUE_ID(next) = cur->next) \
             if (cur->key == (k))
 
-#endif
-
-// list.h
-// ------------------------------------
-
-#ifndef HS_LIST_H
-#define HS_LIST_H
-
-// #include "common.h"
-
-typedef struct _hs_list_head {
-    struct _hs_list_head *prev;
-    struct _hs_list_head *next;
-} _hs_list_head;
-
-#define _HS_LIST(list) \
-    _hs_list_head list = {&list, &list}
-
-static inline void _hs_list_init(_hs_list_head *list)
-{
-    list->prev = list;
-    list->next = list;
-}
-
-static inline void _hs_list_insert_internal(_hs_list_head *prev, _hs_list_head *next, _hs_list_head *head)
-{
-    prev->next = head;
-    head->prev = prev;
-
-    next->prev = head;
-    head->next = next;
-}
-
-static inline void _hs_list_add(_hs_list_head *list, _hs_list_head *head)
-{
-    _hs_list_insert_internal(list, list->next, head);
-}
-
-static inline void _hs_list_add_tail(_hs_list_head *list, _hs_list_head *head)
-{
-    _hs_list_insert_internal(list->prev, list, head);
-}
-
-static inline void _hs_list_remove(_hs_list_head *head)
-{
-    head->prev->next = head->next;
-    head->next->prev = head->prev;
-
-    head->prev = NULL;
-    head->next = NULL;
-}
-
-static inline bool _hs_list_is_empty(const _hs_list_head *head)
-{
-    return head->next == head;
-}
-
-static inline bool _hs_list_is_singular(const _hs_list_head *head)
-{
-    return head->next != head && head->next == head->prev;
-}
-
-#define _hs_list_get_first(head, type, member) \
-    (_hs_list_is_empty(head) ? NULL : _hs_container_of((head)->next, type, member))
-#define _hs_list_get_last(head, type, member) \
-    (_hs_list_is_empty(head) ? NULL : _hs_container_of((head)->prev, type, member))
-
-static inline void _hs_list_splice_internal(_hs_list_head *prev, _hs_list_head *next, _hs_list_head *head)
-{
-    if (_hs_list_is_empty(head))
-        return;
-
-    head->next->prev = prev;
-    prev->next = head->next;
-
-    head->prev->next = next;
-    next->prev = head->prev;
-
-    _hs_list_init(head);
-}
-
-static inline void _hs_list_splice(_hs_list_head *list, _hs_list_head *from)
-{
-    _hs_list_splice_internal(list, list->next, from);
-}
-
-static inline void _hs_list_splice_tail(_hs_list_head *list, _hs_list_head *from)
-{
-    _hs_list_splice_internal(list->prev, list, from);
-}
-
-#define _hs_list_foreach(cur, head) \
-    if ((head)->next) \
-        for (_hs_list_head *cur = (head)->next, *_HS_UNIQUE_ID(next) = cur->next; cur != (head); \
-             cur = _HS_UNIQUE_ID(next), _HS_UNIQUE_ID(next) = cur->next)
+HS_END_C
 
 #endif
 
@@ -650,7 +625,7 @@ struct hs_port;
  * @param dev Device object.
  * @return This function returns the device object, for convenience.
  */
-HS_PUBLIC hs_device *hs_device_ref(hs_device *dev);
+hs_device *hs_device_ref(hs_device *dev);
 /**
  * @ingroup device
  * @brief Decrease the device reference count.
@@ -659,7 +634,7 @@ HS_PUBLIC hs_device *hs_device_ref(hs_device *dev);
  *
  * @param dev Device object.
  */
-HS_PUBLIC void hs_device_unref(hs_device *dev);
+void hs_device_unref(hs_device *dev);
 
 /**
   * @{
@@ -678,14 +653,14 @@ HS_PUBLIC void hs_device_unref(hs_device *dev);
  * @param[out] rport Device handle, the value is changed only if the function succeeds.
  * @return This function returns 0 on success, or a negative @ref hs_error_code value.
  */
-HS_PUBLIC int hs_port_open(hs_device *dev, hs_port_mode mode, hs_port **rport);
+int hs_port_open(hs_device *dev, hs_port_mode mode, hs_port **rport);
 /**
  * @ingroup device
  * @brief Close a device, and free all used resources.
  *
  * @param port Device handle.
  */
-HS_PUBLIC void hs_port_close(hs_port *port);
+void hs_port_close(hs_port *port);
 
 /**
  * @ingroup device
@@ -694,7 +669,7 @@ HS_PUBLIC void hs_port_close(hs_port *port);
  * @param port Device handle.
  * @return Device object.
  */
-HS_PUBLIC hs_device *hs_port_get_device(const hs_port *port);
+hs_device *hs_port_get_device(const hs_port *port);
 /**
  * @ingroup device
  * @brief Get a pollable device handle.
@@ -715,7 +690,7 @@ HS_PUBLIC hs_device *hs_port_get_device(const hs_port *port);
  *
  * @sa hs_handle
  */
-HS_PUBLIC hs_handle hs_port_get_poll_handle(const hs_port *port);
+hs_handle hs_port_get_poll_handle(const hs_port *port);
 
 HS_END_C
 
@@ -754,7 +729,7 @@ HS_BEGIN_C
  * @return This function returns the size of the report in bytes + 1 (report ID). It
  *     returns 0 on timeout, or a negative @ref hs_error_code value.
  */
-HS_PUBLIC ssize_t hs_hid_read(hs_port *port, uint8_t *buf, size_t size, int timeout);
+ssize_t hs_hid_read(hs_port *port, uint8_t *buf, size_t size, int timeout);
 /**
  * @ingroup hid
  * @brief Send an output report to the device.
@@ -768,7 +743,7 @@ HS_PUBLIC ssize_t hs_hid_read(hs_port *port, uint8_t *buf, size_t size, int time
  * @return This function returns the size of the report in bytes + 1 (report ID),
  *     or a negative error code.
  */
-HS_PUBLIC ssize_t hs_hid_write(hs_port *port, const uint8_t *buf, size_t size);
+ssize_t hs_hid_write(hs_port *port, const uint8_t *buf, size_t size);
 
 /**
  * @ingroup hid
@@ -785,8 +760,7 @@ HS_PUBLIC ssize_t hs_hid_write(hs_port *port, const uint8_t *buf, size_t size);
  * @return This function returns the size of the report in bytes + 1 (report ID),
  *     or a negative @ref hs_error_code value.
  */
-HS_PUBLIC ssize_t hs_hid_get_feature_report(hs_port *port, uint8_t report_id,
-                                            uint8_t *buf, size_t size);
+ssize_t hs_hid_get_feature_report(hs_port *port, uint8_t report_id, uint8_t *buf, size_t size);
 /**
  * @ingroup hid
  * @brief Send a feature report to the device.
@@ -800,7 +774,7 @@ HS_PUBLIC ssize_t hs_hid_get_feature_report(hs_port *port, uint8_t report_id,
  * @return This function returns the size of the report in bytes + 1 (report ID),
  *     or a negative @ref hs_error_code value.
  */
-HS_PUBLIC ssize_t hs_hid_send_feature_report(hs_port *port, const uint8_t *buf, size_t size);
+ssize_t hs_hid_send_feature_report(hs_port *port, const uint8_t *buf, size_t size);
 
 HS_END_C
 
@@ -939,8 +913,7 @@ typedef int hs_enumerate_func(struct hs_device *dev, void *udata);
  * @sa hs_match Match specific devices.
  * @sa hs_enumerate_func() for more information about the callback.
  */
-HS_PUBLIC int hs_enumerate(const hs_match *matches, unsigned int count,
-                           hs_enumerate_func *f, void *udata);
+int hs_enumerate(const hs_match *matches, unsigned int count, hs_enumerate_func *f, void *udata);
 
 /**
  * @ingroup monitor
@@ -954,7 +927,7 @@ HS_PUBLIC int hs_enumerate(const hs_match *matches, unsigned int count,
  * @return This function returns 1 if a device is found, 0 if not or a negative @ref hs_error_code
  *     value.
  */
-HS_PUBLIC int hs_find(const hs_match *matches, unsigned int count, struct hs_device **rdev);
+int hs_find(const hs_match *matches, unsigned int count, struct hs_device **rdev);
 
 /**
  * @{
@@ -974,7 +947,7 @@ HS_PUBLIC int hs_find(const hs_match *matches, unsigned int count, struct hs_dev
  *
  * @sa hs_monitor_free()
  */
-HS_PUBLIC int hs_monitor_new(const hs_match *matches, unsigned int count, hs_monitor **rmonitor);
+int hs_monitor_new(const hs_match *matches, unsigned int count, hs_monitor **rmonitor);
 /**
  * @ingroup monitor
  * @brief Close a device monitor.
@@ -986,7 +959,7 @@ HS_PUBLIC int hs_monitor_new(const hs_match *matches, unsigned int count, hs_mon
  *
  * @sa hs_monitor_new()
  */
-HS_PUBLIC void hs_monitor_free(hs_monitor *monitor);
+void hs_monitor_free(hs_monitor *monitor);
 
 /**
  * @ingroup monitor
@@ -1008,7 +981,7 @@ HS_PUBLIC void hs_monitor_free(hs_monitor *monitor);
  * @sa hs_handle
  * @sa hs_monitor_refresh()
  */
-HS_PUBLIC hs_handle hs_monitor_get_poll_handle(const hs_monitor *monitor);
+hs_handle hs_monitor_get_poll_handle(const hs_monitor *monitor);
 
 /**
  * @ingroup monitor
@@ -1024,14 +997,14 @@ HS_PUBLIC hs_handle hs_monitor_get_poll_handle(const hs_monitor *monitor);
  * @param monitor Device monitor.
  * @return This function returns 0 on success, or a negative @ref hs_error_code value.
  */
-HS_PUBLIC int hs_monitor_start(hs_monitor *monitor);
+int hs_monitor_start(hs_monitor *monitor);
 /**
  * @ingroup monitor
  * @brief Stop listening to OS notifications.
  *
  * @param monitor Device monitor.
  */
-HS_PUBLIC void hs_monitor_stop(hs_monitor *monitor);
+void hs_monitor_stop(hs_monitor *monitor);
 
 /**
  * @ingroup monitor
@@ -1050,7 +1023,7 @@ HS_PUBLIC void hs_monitor_stop(hs_monitor *monitor);
  *
  * @sa hs_enumerate_func() for more information about the callback.
  */
-HS_PUBLIC int hs_monitor_refresh(hs_monitor *monitor, hs_enumerate_func *f, void *udata);
+int hs_monitor_refresh(hs_monitor *monitor, hs_enumerate_func *f, void *udata);
 
 /**
  * @ingroup monitor
@@ -1068,7 +1041,7 @@ HS_PUBLIC int hs_monitor_refresh(hs_monitor *monitor, hs_enumerate_func *f, void
  * @sa hs_monitor_refresh()
  * @sa hs_enumerate_func() for more information about the callback.
  */
-HS_PUBLIC int hs_monitor_list(hs_monitor *monitor, hs_enumerate_func *f, void *udata);
+int hs_monitor_list(hs_monitor *monitor, hs_enumerate_func *f, void *udata);
 
 HS_END_C
 
@@ -1146,7 +1119,7 @@ typedef struct hs_poll_source {
  *
  * @return This function returns a mononotic time value in milliseconds.
  */
-HS_PUBLIC uint64_t hs_millis(void);
+uint64_t hs_millis(void);
 
 /**
  * @ingroup misc
@@ -1173,7 +1146,7 @@ HS_PUBLIC uint64_t hs_millis(void);
  *
  * @return This function returns the adjusted value, or -1 if @p timeout is negative.
  */
-HS_PUBLIC int hs_adjust_timeout(int timeout, uint64_t start);
+int hs_adjust_timeout(int timeout, uint64_t start);
 
 #ifdef __linux__
 /**
@@ -1189,7 +1162,7 @@ HS_PUBLIC int hs_adjust_timeout(int timeout, uint64_t start);
  *
  * @return This function returns the version number.
  */
-HS_PUBLIC uint32_t hs_linux_version(void);
+uint32_t hs_linux_version(void);
 #endif
 
 #ifdef _WIN32
@@ -1204,7 +1177,7 @@ HS_PUBLIC uint32_t hs_linux_version(void);
  * @return This function returns a private buffer containing the error string, valid until the
  *     next call to hs_win32_strerror().
  */
-HS_PUBLIC const char *hs_win32_strerror(unsigned long err);
+const char *hs_win32_strerror(unsigned long err);
 /**
  * @ingroup misc
  * @brief Get the Windows version as a composite decimal number.
@@ -1217,7 +1190,7 @@ HS_PUBLIC const char *hs_win32_strerror(unsigned long err);
  *
  * @return This function returns the version number.
  */
-HS_PUBLIC uint32_t hs_win32_version(void);
+uint32_t hs_win32_version(void);
 #endif
 
 #ifdef __APPLE__
@@ -1230,7 +1203,7 @@ HS_PUBLIC uint32_t hs_win32_version(void);
  *
  * @return This function returns the version number.
  */
-HS_PUBLIC uint32_t hs_darwin_version(void);
+uint32_t hs_darwin_version(void);
 #endif
 
 /**
@@ -1253,7 +1226,7 @@ HS_PUBLIC uint32_t hs_darwin_version(void);
  *
  * @sa hs_poll_source
  */
-HS_PUBLIC int hs_poll(hs_poll_source *sources, unsigned int count, int timeout);
+int hs_poll(hs_poll_source *sources, unsigned int count, int timeout);
 
 HS_END_C
 
@@ -1444,7 +1417,7 @@ typedef struct hs_serial_config {
  *
  * @sa hs_serial_config for available serial settings.
  */
-HS_PUBLIC int hs_serial_set_config(hs_port *port, const hs_serial_config *config);
+int hs_serial_set_config(hs_port *port, const hs_serial_config *config);
 
 /**
  * @ingroup serial
@@ -1463,7 +1436,7 @@ HS_PUBLIC int hs_serial_set_config(hs_port *port, const hs_serial_config *config
  *
  * @sa hs_serial_config for available serial settings.
  */
-HS_PUBLIC int hs_serial_get_config(hs_port *port, hs_serial_config *config);
+int hs_serial_get_config(hs_port *port, hs_serial_config *config);
 
 /**
  * @ingroup serial
@@ -1478,7 +1451,7 @@ HS_PUBLIC int hs_serial_get_config(hs_port *port, hs_serial_config *config);
  * @param      timeout Timeout in milliseconds, or -1 to block indefinitely.
  * @return This function returns the number of bytes read, or a negative @ref hs_error_code value.
  */
-HS_PUBLIC ssize_t hs_serial_read(hs_port *port, uint8_t *buf, size_t size, int timeout);
+ssize_t hs_serial_read(hs_port *port, uint8_t *buf, size_t size, int timeout);
 /**
  * @ingroup serial
  * @brief Send bytes to a serial device.
@@ -1493,7 +1466,7 @@ HS_PUBLIC ssize_t hs_serial_read(hs_port *port, uint8_t *buf, size_t size, int t
  * @return This function returns the number of bytes written, or a negative @ref hs_error_code
  *     value.
  */
-HS_PUBLIC ssize_t hs_serial_write(hs_port *port, const uint8_t *buf, size_t size, int timeout);
+ssize_t hs_serial_write(hs_port *port, const uint8_t *buf, size_t size, int timeout);
 
 HS_END_C
 
@@ -1574,9 +1547,6 @@ int _hs_vasprintf(char **strp, const char *fmt, va_list ap);
 
 #define _HS_ALIGN_SIZE(size, align) (((size) + (align) - 1) / (align) * (align))
 #define _HS_ALIGN_SIZE_FOR_TYPE(size, type) _HS_ALIGN_SIZE((size), sizeof(type))
-
-#define _HS_CONCAT_HELPER(a, b) a ## b
-#define _HS_CONCAT(a, b) _HS_CONCAT_HELPER(a, b)
 
 #endif
 
@@ -1847,7 +1817,7 @@ int _hs_vasprintf(char **strp, const char *fmt, va_list ap)
         return -1;
     va_end(ap_copy);
 
-    s = malloc((size_t)r + 1);
+    s = (char *)malloc((size_t)r + 1);
     if (!s)
         return -1;
 
@@ -1861,6 +1831,69 @@ int _hs_vasprintf(char **strp, const char *fmt, va_list ap)
     return r;
 }
 #endif
+
+// array.c
+// ------------------------------------
+
+// #include "common_priv.h"
+// #include "array.h"
+
+void _hs_array_release_(struct _hs_array *array)
+{
+    assert(array);
+
+    free(array->values);
+
+    array->values = NULL;
+    array->allocated = 0;
+    array->count = 0;
+}
+
+int _hs_array_expand_(struct _hs_array *array, size_t value_size, size_t need)
+{
+    assert(array);
+    assert(array->count <= SIZE_MAX - need);
+
+    if (need > array->allocated - array->count) {
+        size_t new_size;
+        void *new_values;
+
+        new_size = 4;
+        while (new_size < array->count)
+            new_size += new_size / 2;
+        while (need > new_size - array->count)
+            new_size += new_size / 2;
+        new_values = realloc(array->values, new_size * value_size);
+        if (!new_values)
+            return hs_error(HS_ERROR_MEMORY, NULL);
+        memset((uint8_t *)new_values + (array->allocated * value_size), 0,
+               (new_size - array->allocated) * value_size);
+
+        array->values = new_values;
+        array->allocated = new_size;
+    }
+
+    return 0;
+}
+
+void _hs_array_shrink_(struct _hs_array *array, size_t value_size)
+{
+    assert(array);
+
+    if (array->count) {
+        void *new_items = realloc(array->values, array->count * value_size);
+        if (!new_items)
+            return;
+
+        array->values = new_items;
+        array->allocated = array->count;
+    } else {
+        free(array->values);
+
+        array->values = NULL;
+        array->allocated = 0;
+    }
+}
 
 // device.c
 // ------------------------------------
@@ -1913,8 +1946,8 @@ void _hs_device_log(const hs_device *dev, const char *verb)
 {
     switch (dev->type) {
     case HS_DEVICE_TYPE_SERIAL:
-        hs_log(HS_LOG_DEBUG, "%s serial device '%s' on iface %"PRIu8"\n"
-                             "  - USB VID/PID = %04"PRIx16":%04"PRIx16", USB location = %s\n"
+        hs_log(HS_LOG_DEBUG, "%s serial device '%s' on iface %u\n"
+                             "  - USB VID/PID = %04x:%04x, USB location = %s\n"
                              "  - USB manufacturer = %s, product = %s, S/N = %s",
                verb, dev->key, dev->iface_number, dev->vid, dev->pid, dev->location,
                dev->manufacturer_string ? dev->manufacturer_string : "(none)",
@@ -1923,10 +1956,10 @@ void _hs_device_log(const hs_device *dev, const char *verb)
         break;
 
     case HS_DEVICE_TYPE_HID:
-        hs_log(HS_LOG_DEBUG, "%s HID device '%s' on iface %"PRIu8"\n"
-                             "  - USB VID/PID = %04"PRIx16":%04"PRIx16", USB location = %s\n"
+        hs_log(HS_LOG_DEBUG, "%s HID device '%s' on iface %u\n"
+                             "  - USB VID/PID = %04x:%04x, USB location = %s\n"
                              "  - USB manufacturer = %s, product = %s, S/N = %s\n"
-                             "  - HID usage page = 0x%"PRIx16", HID usage = 0x%"PRIx16,
+                             "  - HID usage page = 0x%x, HID usage = 0x%x",
                verb, dev->key, dev->iface_number, dev->vid, dev->pid, dev->location,
                dev->manufacturer_string ? dev->manufacturer_string : "(none)",
                dev->product_string ? dev->product_string : "(none)",
@@ -2118,7 +2151,7 @@ bool _hs_filter_has_type(const _hs_filter *filter, hs_device_type type)
 
 int _hs_htable_init(_hs_htable *table, unsigned int size)
 {
-    table->heads = malloc(size * sizeof(*table->heads));
+    table->heads = (void **)malloc(size * sizeof(*table->heads));
     if (!table->heads)
         return hs_error(HS_ERROR_MEMORY, NULL);
     table->size = size;
@@ -2184,7 +2217,7 @@ void _hs_htable_clear(_hs_htable *table)
 
 static int find_callback(hs_device *dev, void *udata)
 {
-    hs_device **rdev = udata;
+    hs_device **rdev = (hs_device **)udata;
 
     *rdev = hs_device_ref(dev);
     return 1;
@@ -2311,7 +2344,7 @@ int _hs_open_file_port(hs_device *dev, hs_port_mode mode, hs_port **rport)
     DWORD access;
     int r;
 
-    port = calloc(1, sizeof(*port));
+    port = (hs_port *)calloc(1, sizeof(*port));
     if (!port) {
         r = hs_error(HS_ERROR_MEMORY, NULL);
         goto error;
@@ -2411,7 +2444,7 @@ int _hs_open_file_port(hs_device *dev, hs_port_mode mode, hs_port **rport)
     }
 
     if (mode & HS_PORT_MODE_READ) {
-        port->u.handle.read_ov = calloc(1, sizeof(*port->u.handle.read_ov));
+        port->u.handle.read_ov = (OVERLAPPED *)calloc(1, sizeof(*port->u.handle.read_ov));
         if (!port->u.handle.read_ov) {
             r = hs_error(HS_ERROR_MEMORY, NULL);
             goto error;
@@ -2423,7 +2456,7 @@ int _hs_open_file_port(hs_device *dev, hs_port_mode mode, hs_port **rport)
             goto error;
         }
 
-        port->u.handle.read_buf = malloc(READ_BUFFER_SIZE);
+        port->u.handle.read_buf = (uint8_t *)malloc(READ_BUFFER_SIZE);
         if (!port->u.handle.read_buf) {
             r = hs_error(HS_ERROR_MEMORY, NULL);
             goto error;
@@ -2471,7 +2504,7 @@ error:
 
 static unsigned int __stdcall overlapped_cleanup_thread(void *udata)
 {
-    hs_port *port = udata;
+    hs_port *port = (hs_port *)udata;
     DWORD ret;
 
     /* Give up if nothing happens, even if it means a leak; we'll get rid of this when XP
@@ -2631,7 +2664,9 @@ ssize_t _hs_win32_write_sync(hs_port *port, const uint8_t *buf, size_t size, int
 // #include "common_priv.h"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <hidsdi.h>
+HS_BEGIN_C
+    #include <hidsdi.h>
+HS_END_C
 #include <winioctl.h>
 // #include "device_priv.h"
 // #include "hid.h"
@@ -2753,8 +2788,10 @@ ssize_t hs_hid_send_feature_report(hs_port *port, const uint8_t *buf, size_t siz
 #include <cfgmgr32.h>
 #include <dbt.h>
 #include <devioctl.h>
-#include <hidsdi.h>
-#include <hidpi.h>
+HS_BEGIN_C
+    #include <hidsdi.h>
+    #include <hidpi.h>
+HS_END_C
 #include <initguid.h>
 #include <process.h>
 #include <setupapi.h>
@@ -2763,40 +2800,42 @@ ssize_t hs_hid_send_feature_report(hs_port *port, const uint8_t *buf, size_t siz
 #include <usbioctl.h>
 #include <usbuser.h>
 #include <wchar.h>
+// #include "array.h"
 // #include "device_priv.h"
 // #include "filter_priv.h"
-// #include "list.h"
 // #include "monitor_priv.h"
 // #include "platform.h"
+
+enum event_type {
+    DEVICE_EVENT_ADDED,
+    DEVICE_EVENT_REMOVED
+};
+
+struct event {
+    enum event_type type;
+    char device_key[256];
+};
+
+typedef _HS_ARRAY(struct event) event_array;
 
 struct hs_monitor {
     _hs_filter filter;
     _hs_htable devices;
 
     HANDLE thread;
-    HANDLE thread_hwnd;
+    HWND thread_hwnd;
 
     HANDLE thread_event;
-    CRITICAL_SECTION notifications_lock;
-    _hs_list_head notifications;
-    _hs_list_head pending_notifications;
+    CRITICAL_SECTION events_lock;
+    event_array events;
+    event_array thread_events;
+    event_array refresh_events;
     int thread_ret;
 };
 
 struct setup_class {
     const char *name;
     hs_device_type type;
-};
-
-enum notification_type {
-    DEVICE_EVENT_ADDED,
-    DEVICE_EVENT_REMOVED
-};
-
-struct notification {
-    enum notification_type event;
-    _hs_list_head node;
-    char device_key[];
 };
 
 struct device_cursor {
@@ -2901,7 +2940,7 @@ static int build_device_path(const char *id, const GUID *guid, char **rpath)
 {
     char *path, *ptr;
 
-    path = malloc(4 + strlen(id) + 41);
+    path = (char *)malloc(4 + strlen(id) + 41);
     if (!path)
         return hs_error(HS_ERROR_MEMORY, NULL);
 
@@ -2960,7 +2999,7 @@ static int wide_to_cstring(const wchar_t *wide, size_t size, char **rs)
     char *s = NULL;
     int len, r;
 
-    tmp = calloc(1, size + sizeof(wchar_t));
+    tmp = (wchar_t *)calloc(1, size + sizeof(wchar_t));
     if (!tmp) {
         r = hs_error(HS_ERROR_MEMORY, NULL);
         goto cleanup;
@@ -2975,7 +3014,7 @@ static int wide_to_cstring(const wchar_t *wide, size_t size, char **rs)
         goto cleanup;
     }
 
-    s = malloc((size_t)len);
+    s = (char *)malloc((size_t)len);
     if (!s) {
         r = hs_error(HS_ERROR_MEMORY, NULL);
         goto cleanup;
@@ -3008,7 +3047,7 @@ static int get_port_driverkey(HANDLE hub, uint8_t port, char **rkey)
     int r;
 
     len = sizeof(node) + (sizeof(USB_PIPE_INFO) * 30);
-    node = calloc(1, len);
+    node = (USB_NODE_CONNECTION_INFORMATION_EX *)calloc(1, len);
     if (!node) {
         r = hs_error(HS_ERROR_MEMORY, NULL);
         goto cleanup;
@@ -3038,7 +3077,7 @@ static int get_port_driverkey(HANDLE hub, uint8_t port, char **rkey)
         goto cleanup;
     }
 
-    wide = calloc(1, pseudo.ActualLength);
+    wide = (USB_NODE_CONNECTION_DRIVERKEY_NAME *)calloc(1, pseudo.ActualLength);
     if (!wide) {
         r = hs_error(HS_ERROR_MEMORY, NULL);
         goto cleanup;
@@ -3162,7 +3201,7 @@ static int resolve_usb_location_ioctl(struct device_cursor usb_cursor, uint8_t p
         if (r <= 0)
             return r;
         ports[depth] = (uint8_t)r;
-        hs_log(HS_LOG_DEBUG, "Found port number of '%s': %"PRIu8, usb_cursor.id, ports[depth]);
+        hs_log(HS_LOG_DEBUG, "Found port number of '%s': %u", usb_cursor.id, ports[depth]);
         depth++;
 
         // We need place for the root hub index
@@ -3187,6 +3226,7 @@ static int resolve_usb_location_cfgmgr(struct device_cursor usb_cursor, uint8_t 
     do {
         char location_buf[256];
         DWORD location_len;
+        unsigned int location_port;
         CONFIGRET cret;
 
         // Extract port from CM_DRP_LOCATION_INFORMATION (Vista and later versions)
@@ -3197,12 +3237,12 @@ static int resolve_usb_location_cfgmgr(struct device_cursor usb_cursor, uint8_t 
             hs_log(HS_LOG_DEBUG, "No location information on this device node");
             return 0;
         }
-        ports[depth] = 0;
-        sscanf(location_buf, "Port_#%04"SCNu8, &ports[depth]);
-        if (!ports[depth])
+        location_port = 0;
+        sscanf(location_buf, "Port_#%04u", &location_port);
+        if (!location_port)
             return 0;
-        hs_log(HS_LOG_DEBUG, "Found port number of '%s': %"PRIu8, usb_cursor.id, ports[depth]);
-        depth++;
+        hs_log(HS_LOG_DEBUG, "Found port number of '%s': %u", usb_cursor.id, location_port);
+        ports[depth++] = (uint8_t)location_port;
 
         // We need place for the root hub index
         if (depth == MAX_USB_DEPTH) {
@@ -3264,7 +3304,7 @@ static int find_device_location(DEVINST inst, uint8_t ports[])
         hs_log(HS_LOG_WARNING, "Unknown USB host controller '%s'", roothub_cursor.id);
         return 0;
     }
-    hs_log(HS_LOG_DEBUG, "Found controller ID for '%s': %"PRIu8, roothub_cursor.id, ports[depth]);
+    hs_log(HS_LOG_DEBUG, "Found controller ID for '%s': %u", roothub_cursor.id, ports[depth]);
     depth++;
 
     // The ports are in the wrong order
@@ -3379,7 +3419,7 @@ static int get_string_descriptor(HANDLE hub, uint8_t port, uint8_t index, char *
                               sizeof(rq), &rq, sizeof(rq), &desc_len, NULL);
     if (!success || desc_len < 2 || rq.desc.bDescriptorType != USB_STRING_DESCRIPTOR_TYPE ||
             rq.desc.bLength != desc_len - sizeof(rq.req) || rq.desc.bLength % 2 != 0) {
-        hs_log(HS_LOG_DEBUG, "Invalid string descriptor %"PRIu8, index);
+        hs_log(HS_LOG_DEBUG, "Invalid string descriptor %u", index);
         return 0;
     }
 
@@ -3394,6 +3434,7 @@ static int get_string_descriptor(HANDLE hub, uint8_t port, uint8_t index, char *
 static int read_device_properties(hs_device *dev, DEVINST inst, uint8_t port)
 {
     char buf[256];
+    unsigned int vid, pid, iface_number;
     char *path = NULL;
     HANDLE hub = NULL;
     DWORD len;
@@ -3421,13 +3462,18 @@ static int read_device_properties(hs_device *dev, DEVINST inst, uint8_t port)
         goto cleanup;
     }
 
-    dev->iface_number = 0;
-    r = sscanf(buf, "USB\\VID_%04hx&PID_%04hx&MI_%02hhu", &dev->vid, &dev->pid, &dev->iface_number);
+    /* h and hh type modifier characters are not known to msvcrt, and MinGW issues warnings
+       if we try to use them. Use temporary unsigned int variables to get around that. */
+    iface_number = 0;
+    r = sscanf(buf, "USB\\VID_%04x&PID_%04x&MI_%02u", &vid, &pid, &iface_number);
     if (r < 2) {
         hs_log(HS_LOG_WARNING, "Failed to parse USB properties from '%s'", buf);
         r = 0;
         goto cleanup;
     }
+    dev->vid = (uint16_t)vid;
+    dev->pid = (uint16_t)pid;
+    dev->iface_number = (uint8_t)iface_number;
 
     // Now we need the device handle for the USB hub where the device is plugged
     if (r == 3) {
@@ -3464,7 +3510,7 @@ static int read_device_properties(hs_device *dev, DEVINST inst, uint8_t port)
     }
 
     len = sizeof(node) + (sizeof(USB_PIPE_INFO) * 30);
-    node = calloc(1, len);
+    node = (USB_NODE_CONNECTION_INFORMATION_EX *)calloc(1, len);
     if (!node) {
         r = hs_error(HS_ERROR_MEMORY, NULL);
         goto cleanup;
@@ -3592,7 +3638,7 @@ static int process_win32_device(DEVINST inst, const char *id, hs_device **rdev)
     unsigned int depth;
     int r;
 
-    dev = calloc(1, sizeof(*dev));
+    dev = (hs_device *)calloc(1, sizeof(*dev));
     if (!dev) {
         r = hs_error(HS_ERROR_MEMORY, NULL);
         goto cleanup;
@@ -3821,7 +3867,7 @@ struct enumerate_enumerate_context {
 
 static int enumerate_enumerate_callback(hs_device *dev, void *udata)
 {
-    struct enumerate_enumerate_context *ctx = udata;
+    struct enumerate_enumerate_context *ctx = (struct enumerate_enumerate_context *)udata;
 
     _hs_device_log(dev, "Enumerate");
     return (*ctx->f)(dev, ctx->udata);
@@ -3848,12 +3894,14 @@ int hs_enumerate(const hs_match *matches, unsigned int count, hs_enumerate_func 
     return r;
 }
 
-static int post_notification(hs_monitor *monitor, enum notification_type event,
-                             DEV_BROADCAST_DEVICEINTERFACE *msg)
+static int post_event(hs_monitor *monitor, enum event_type event_type,
+                      DEV_BROADCAST_DEVICEINTERFACE *msg)
 {
-    const char *id, *id_end;
-    struct notification *notif;
+    const char *id;
+    size_t id_len;
+    struct event *event;
     UINT_PTR timer;
+    int r;
 
     if (msg->dbcc_devicetype != DBT_DEVTYP_DEVICEINTERFACE)
         return 0;
@@ -3864,33 +3912,37 @@ static int post_notification(hs_monitor *monitor, enum notification_type event,
        You may notice that paths from RegisterDeviceNotification() seem to start with '\\?\',
        which according to MSDN is the file namespace, not the device namespace '\\.\'. Oh well. */
     id = msg->dbcc_name;
-    id_end = id + strlen(id);
     if (strncmp(id, "\\\\?\\", 4) == 0
             || strncmp(id, "\\\\.\\", 4) == 0
             || strncmp(id, "##.#", 4) == 0
             || strncmp(id, "##?#", 4) == 0)
         id += 4;
-    if (id_end - id >= 39 && id_end[-39] == '#' && id_end[-38] == '{' && id_end[-1] == '}')
-        id_end -= 39;
+    id_len = strlen(id);
+    if (id_len >= 39 && id[id_len - 39] == '#' && id[id_len - 38] == '{' && id[id_len - 1] == '}')
+        id_len -= 39;
 
-    notif = malloc(sizeof(*notif) + (size_t)(id_end - id + 1));
-    if (!notif)
-        return hs_error(HS_ERROR_MEMORY, NULL);
-    notif->event = event;
-    memcpy(notif->device_key, id, (size_t)(id_end - id));
-    notif->device_key[id_end - id] = 0;
+    if (id_len >= sizeof(event->device_key)) {
+        hs_log(HS_LOG_WARNING, "Device instance ID string '%s' is too long, ignoring", id);
+        return 0;
+    }
+    r = _hs_array_grow(&monitor->thread_events, 1);
+    if (r < 0)
+        return r;
+    event = &monitor->thread_events.values[monitor->thread_events.count];
+    event->type = event_type;
+    memcpy(event->device_key, id, id_len);
+    event->device_key[id_len] = 0;
+    monitor->thread_events.count++;
 
     /* Normalize device instance ID, uppercase and replace '#' with '\'. Could not do it on msg,
        Windows may not like it. Maybe, not sure so don't try. */
-    for (char *ptr = notif->device_key; *ptr; ptr++) {
+    for (char *ptr = event->device_key; *ptr; ptr++) {
         if (*ptr == '#') {
             *ptr = '\\';
         } else if (*ptr >= 97 && *ptr <= 122) {
             *ptr = (char)(*ptr - 32);
         }
     }
-
-    _hs_list_add_tail(&monitor->pending_notifications, &notif->node);
 
     timer = SetTimer(monitor->thread_hwnd, 1, 100, NULL);
     if (!timer)
@@ -3902,7 +3954,6 @@ static int post_notification(hs_monitor *monitor, enum notification_type event,
 static LRESULT __stdcall window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
     hs_monitor *monitor = (hs_monitor *)GetWindowLongPtr(hwnd, GWLP_USERDATA);
-
     int r;
 
     switch (msg) {
@@ -3910,19 +3961,19 @@ static LRESULT __stdcall window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM 
         r = 0;
         switch (wparam) {
         case DBT_DEVICEARRIVAL:
-            r = post_notification(monitor, DEVICE_EVENT_ADDED,
+            r = post_event(monitor, DEVICE_EVENT_ADDED,
                                   (DEV_BROADCAST_DEVICEINTERFACE *)lparam);
             break;
         case DBT_DEVICEREMOVECOMPLETE:
-            r = post_notification(monitor, DEVICE_EVENT_REMOVED,
+            r = post_event(monitor, DEVICE_EVENT_REMOVED,
                                   (DEV_BROADCAST_DEVICEINTERFACE *)lparam);
             break;
         }
         if (r < 0) {
-            EnterCriticalSection(&monitor->notifications_lock);
+            EnterCriticalSection(&monitor->events_lock);
             monitor->thread_ret = r;
             SetEvent(monitor->thread_event);
-            LeaveCriticalSection(&monitor->notifications_lock);
+            LeaveCriticalSection(&monitor->events_lock);
         }
         break;
 
@@ -3930,10 +3981,19 @@ static LRESULT __stdcall window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM 
         if (CMP_WaitNoPendingInstallEvents(0) == WAIT_OBJECT_0) {
             KillTimer(hwnd, 1);
 
-            EnterCriticalSection(&monitor->notifications_lock);
-            _hs_list_splice_tail(&monitor->notifications, &monitor->pending_notifications);
+            EnterCriticalSection(&monitor->events_lock);
+            r = _hs_array_grow(&monitor->events, monitor->thread_events.count);
+            if (r < 0) {
+                monitor->thread_ret = r;
+            } else {
+                memcpy(monitor->events.values + monitor->events.count,
+                       monitor->thread_events.values,
+                       monitor->thread_events.count * sizeof(*monitor->thread_events.values));
+                monitor->events.count += monitor->thread_events.count;
+                _hs_array_release(&monitor->thread_events);
+            }
             SetEvent(monitor->thread_event);
-            LeaveCriticalSection(&monitor->notifications_lock);
+            LeaveCriticalSection(&monitor->events_lock);
         }
         break;
 
@@ -3954,7 +4014,7 @@ static unsigned int __stdcall monitor_thread(void *udata)
 {
     _HS_UNUSED(udata);
 
-    hs_monitor *monitor = udata;
+    hs_monitor *monitor = (hs_monitor *)udata;
 
     WNDCLASSEX cls = {0};
     ATOM cls_atom;
@@ -4027,7 +4087,7 @@ cleanup:
 
 static int monitor_enumerate_callback(hs_device *dev, void *udata)
 {
-    hs_monitor *monitor = udata;
+    hs_monitor *monitor = (hs_monitor *)udata;
 
     if (!_hs_filter_match_device(&monitor->filter, dev))
         return 0;
@@ -4045,7 +4105,7 @@ int hs_monitor_new(const hs_match *matches, unsigned int count, hs_monitor **rmo
     hs_monitor *monitor;
     int r;
 
-    monitor = calloc(1, sizeof(*monitor));
+    monitor = (hs_monitor *)calloc(1, sizeof(*monitor));
     if (!monitor) {
         r = hs_error(HS_ERROR_MEMORY, NULL);
         goto error;
@@ -4059,15 +4119,12 @@ int hs_monitor_new(const hs_match *matches, unsigned int count, hs_monitor **rmo
     if (r < 0)
         goto error;
 
-    InitializeCriticalSection(&monitor->notifications_lock);
+    InitializeCriticalSection(&monitor->events_lock);
     monitor->thread_event = CreateEvent(NULL, TRUE, FALSE, NULL);
     if (!monitor->thread_event) {
         r = hs_error(HS_ERROR_SYSTEM, "CreateEvent() failed: %s", hs_win32_strerror(0));
         goto error;
     }
-
-    _hs_list_init(&monitor->notifications);
-    _hs_list_init(&monitor->pending_notifications);
 
     *rmonitor = monitor;
     return 0;
@@ -4082,7 +4139,7 @@ void hs_monitor_free(hs_monitor *monitor)
     if (monitor) {
         hs_monitor_stop(monitor);
 
-        DeleteCriticalSection(&monitor->notifications_lock);
+        DeleteCriticalSection(&monitor->events_lock);
         if (monitor->thread_event)
             CloseHandle(monitor->thread_event);
 
@@ -4153,20 +4210,13 @@ void hs_monitor_stop(hs_monitor *monitor)
     CloseHandle(monitor->thread);
     monitor->thread = NULL;
 
-    _hs_list_foreach(cur, &monitor->notifications) {
-        struct notification *notif = _hs_container_of(cur, struct notification, node);
-        free(notif);
-    }
-    _hs_list_foreach(cur, &monitor->pending_notifications) {
-        struct notification *notif = _hs_container_of(cur, struct notification, node);
-        free(notif);
-    }
-    _hs_list_init(&monitor->notifications);
-    _hs_list_init(&monitor->pending_notifications);
+    _hs_array_release(&monitor->events);
+    _hs_array_release(&monitor->thread_events);
+    _hs_array_release(&monitor->refresh_events);
 }
 
-static int process_arrival_notification(hs_monitor *monitor, const char *key, hs_enumerate_func *f,
-                                        void *udata)
+static int process_arrival_event(hs_monitor *monitor, const char *key, hs_enumerate_func *f,
+                                 void *udata)
 {
     DEVINST inst;
     hs_device *dev = NULL;
@@ -4195,43 +4245,43 @@ int hs_monitor_refresh(hs_monitor *monitor, hs_enumerate_func *f, void *udata)
 {
     assert(monitor);
 
-    _HS_LIST(notifications);
+    unsigned int event_idx = 0;
     int r;
 
     if (!monitor->thread)
         return 0;
 
-    /* We don't want to keep the lock for too long, so move all notifications to our own list
-       and let the background thread work and process Win32 events. */
-    EnterCriticalSection(&monitor->notifications_lock);
-    _hs_list_splice(&notifications, &monitor->notifications);
-    r = monitor->thread_ret;
-    monitor->thread_ret = 0;
-    LeaveCriticalSection(&monitor->notifications_lock);
+    if (!monitor->refresh_events.count) {
+        /* We don't want to keep the lock for too long, so move all device events to our
+           own array and let the background thread work and process Win32 events. */
+        EnterCriticalSection(&monitor->events_lock);
+        monitor->refresh_events = monitor->events;
+        monitor->events = (event_array){0};
+        r = monitor->thread_ret;
+        monitor->thread_ret = 0;
+        LeaveCriticalSection(&monitor->events_lock);
+    }
 
     if (r < 0)
         goto cleanup;
 
-    _hs_list_foreach(cur, &notifications) {
-        struct notification *notif = _hs_container_of(cur, struct notification, node);
+    for (; event_idx < monitor->refresh_events.count; event_idx++) {
+        struct event *event = &monitor->refresh_events.values[event_idx];
 
-        switch (notif->event) {
+        switch (event->type) {
         case DEVICE_EVENT_ADDED:
             hs_log(HS_LOG_DEBUG, "Received arrival notification for device '%s'",
-                   notif->device_key);
-            r = process_arrival_notification(monitor, notif->device_key, f, udata);
+                   event->device_key);
+            r = process_arrival_event(monitor, event->device_key, f, udata);
             break;
 
         case DEVICE_EVENT_REMOVED:
             hs_log(HS_LOG_DEBUG, "Received removal notification for device '%s'",
-                   notif->device_key);
-            _hs_monitor_remove(&monitor->devices, notif->device_key, f, udata);
+                   event->device_key);
+            _hs_monitor_remove(&monitor->devices, event->device_key, f, udata);
             r = 0;
             break;
         }
-
-        _hs_list_remove(&notif->node);
-        free(notif);
 
         if (r)
             goto cleanup;
@@ -4239,13 +4289,13 @@ int hs_monitor_refresh(hs_monitor *monitor, hs_enumerate_func *f, void *udata)
 
     r = 0;
 cleanup:
-    /* If an error occurs, there maty be unprocessed notifications. We don't want to lose them so
-       put everything back in front of the notification list. */
-    EnterCriticalSection(&monitor->notifications_lock);
-    _hs_list_splice(&monitor->notifications, &notifications);
-    if (_hs_list_is_empty(&monitor->notifications))
+    /* If an error occurs, there may be unprocessed notifications. Keep them in
+       monitor->refresh_events for the next time this function is called. */
+    _hs_array_deque(&monitor->refresh_events, event_idx);
+    EnterCriticalSection(&monitor->events_lock);
+    if (!monitor->refresh_events.count && !monitor->events.count)
         ResetEvent(monitor->thread_event);
-    LeaveCriticalSection(&monitor->notifications_lock);
+    LeaveCriticalSection(&monitor->events_lock);
     return r;
 }
 
@@ -4707,7 +4757,7 @@ int _hs_open_file_port(hs_device *dev, hs_port_mode mode, hs_port **rport)
     int fd_flags;
     int r;
 
-    port = calloc(1, sizeof(*port));
+    port = (hs_port *)calloc(1, sizeof(*port));
     if (!port) {
         r = hs_error(HS_ERROR_MEMORY, NULL);
         goto error;
@@ -4849,12 +4899,16 @@ hs_handle _hs_get_file_port_poll_handle(const hs_port *port)
 #include <poll.h>
 #include <pthread.h>
 #include <unistd.h>
+// #include "array.h"
 // #include "device_priv.h"
 // #include "hid.h"
-// #include "list.h"
 // #include "platform.h"
 
-// Used for HID devices, see serial_posix.c for serial devices
+struct hid_report {
+    size_t size;
+    uint8_t *data;
+};
+
 struct _hs_hid_darwin {
     io_service_t service;
     union {
@@ -4869,9 +4923,7 @@ struct _hs_hid_darwin {
     int poll_pipe[2];
     int thread_ret;
 
-    _hs_list_head reports;
-    unsigned int allocated_reports;
-    _hs_list_head free_reports;
+    _HS_ARRAY(struct hid_report) reports;
 
     pthread_t read_thread;
     pthread_cond_t cond;
@@ -4882,16 +4934,18 @@ struct _hs_hid_darwin {
     bool device_removed;
 };
 
-static void fire_device_event(hs_port *port)
+#define MAX_REPORT_QUEUE_SIZE 128
+
+static void fire_hid_poll_handle(struct _hs_hid_darwin *hid)
 {
     char buf = '.';
-    write(port->u.hid->poll_pipe[1], &buf, 1);
+    write(hid->poll_pipe[1], &buf, 1);
 }
 
-static void reset_device_event(hs_port *port)
+static void reset_hid_poll_handle(struct _hs_hid_darwin *hid)
 {
     char buf;
-    read(port->u.hid->poll_pipe[0], &buf, 1);
+    read(hid->poll_pipe[0], &buf, 1);
 }
 
 static void hid_removal_callback(void *ctx, IOReturn result, void *sender)
@@ -4899,22 +4953,16 @@ static void hid_removal_callback(void *ctx, IOReturn result, void *sender)
     _HS_UNUSED(result);
     _HS_UNUSED(sender);
 
-    hs_port *port = ctx;
+    hs_port *port = (hs_port *)ctx;
+    struct _hs_hid_darwin *hid = port->u.hid;
 
-    pthread_mutex_lock(&port->u.hid->mutex);
-    port->u.hid->device_removed = true;
-    CFRunLoopSourceSignal(port->u.hid->shutdown_source);
-    pthread_mutex_unlock(&port->u.hid->mutex);
+    pthread_mutex_lock(&hid->mutex);
+    hid->device_removed = true;
+    CFRunLoopSourceSignal(hid->shutdown_source);
+    pthread_mutex_unlock(&hid->mutex);
 
-    fire_device_event(port);
+    fire_hid_poll_handle(hid);
 }
-
-struct hid_report {
-    _hs_list_head list;
-
-    size_t size;
-    uint8_t data[];
-};
 
 static void hid_report_callback(void *ctx, IOReturn result, void *sender,
                                 IOHIDReportType report_type, uint32_t report_id,
@@ -4926,96 +4974,96 @@ static void hid_report_callback(void *ctx, IOReturn result, void *sender,
     if (report_type != kIOHIDReportTypeInput)
         return;
 
-    hs_port *port = ctx;
-
+    hs_port *port = (hs_port *)ctx;
+    struct _hs_hid_darwin *hid = port->u.hid;
     struct hid_report *report;
-    bool fire;
+    bool was_empty;
     int r;
 
-    pthread_mutex_lock(&port->u.hid->mutex);
+    pthread_mutex_lock(&hid->mutex);
 
-    fire = _hs_list_is_empty(&port->u.hid->reports);
+    was_empty = !hid->reports.count;
+    if (hid->reports.count == MAX_REPORT_QUEUE_SIZE) {
+        r = 0;
+        goto cleanup;
+    }
 
-    report = _hs_list_get_first(&port->u.hid->free_reports, struct hid_report, list);
-    if (report) {
-        _hs_list_remove(&report->list);
-    } else {
-        if (port->u.hid->allocated_reports == 64) {
-            r = 0;
-            goto cleanup;
-        }
-
+    r = _hs_array_grow(&hid->reports, 1);
+    if (r < 0)
+        goto cleanup;
+    report = hid->reports.values + hid->reports.count;
+    if (!report->data) {
         // Don't forget the leading report ID
-        report = calloc(1, sizeof(struct hid_report) + port->u.hid->read_size + 1);
-        if (!report) {
+        report->data = (uint8_t *)malloc(hid->read_size + 1);
+        if (!report->data) {
             r = hs_error(HS_ERROR_MEMORY, NULL);
             goto cleanup;
         }
-        port->u.hid->allocated_reports++;
     }
 
-    // You never know, even if port->u.hid->red_size is supposed to be the maximum input report size
-    if (report_size > (CFIndex)port->u.hid->read_size)
-        report_size = (CFIndex)port->u.hid->read_size;
+    /* You never know, even if hid->red_size is supposed to be the maximum
+       input report size. */
+    if (report_size > (CFIndex)hid->read_size)
+        report_size = (CFIndex)hid->read_size;
 
     report->data[0] = (uint8_t)report_id;
     memcpy(report->data + 1, report_data, report_size);
     report->size = (size_t)report_size + 1;
 
-    _hs_list_add_tail(&port->u.hid->reports, &report->list);
+    hid->reports.count++;
 
     r = 0;
 cleanup:
     if (r < 0)
-        port->u.hid->thread_ret = r;
-    pthread_mutex_unlock(&port->u.hid->mutex);
-    if (fire)
-        fire_device_event(port);
+        hid->thread_ret = r;
+    pthread_mutex_unlock(&hid->mutex);
+    if (was_empty)
+        fire_hid_poll_handle(hid);
 }
 
 static void *hid_read_thread(void *ptr)
 {
-    hs_port *port = ptr;
+    hs_port *port = (hs_port *)ptr;
+    struct _hs_hid_darwin *hid = port->u.hid;
     CFRunLoopSourceContext shutdown_ctx = {0};
     int r;
 
-    pthread_mutex_lock(&port->u.hid->mutex);
+    pthread_mutex_lock(&hid->mutex);
 
-    port->u.hid->thread_loop = CFRunLoopGetCurrent();
+    hid->thread_loop = CFRunLoopGetCurrent();
 
-    shutdown_ctx.info = port->u.hid->thread_loop;
+    shutdown_ctx.info = hid->thread_loop;
     shutdown_ctx.perform = (void (*)(void *))CFRunLoopStop;
     /* close_hid_device() could be called before the loop is running, while this thread is between
        pthread_barrier_wait() and CFRunLoopRun(). That's the purpose of the shutdown source. */
-    port->u.hid->shutdown_source = CFRunLoopSourceCreate(kCFAllocatorDefault, 0, &shutdown_ctx);
-    if (!port->u.hid->shutdown_source) {
+    hid->shutdown_source = CFRunLoopSourceCreate(kCFAllocatorDefault, 0, &shutdown_ctx);
+    if (!hid->shutdown_source) {
         r = hs_error(HS_ERROR_SYSTEM, "CFRunLoopSourceCreate() failed");
         goto error;
     }
 
-    CFRunLoopAddSource(port->u.hid->thread_loop, port->u.hid->shutdown_source, kCFRunLoopCommonModes);
-    IOHIDDeviceScheduleWithRunLoop(port->u.hid->hid_ref, port->u.hid->thread_loop, kCFRunLoopCommonModes);
+    CFRunLoopAddSource(hid->thread_loop, hid->shutdown_source, kCFRunLoopCommonModes);
+    IOHIDDeviceScheduleWithRunLoop(hid->hid_ref, hid->thread_loop, kCFRunLoopCommonModes);
 
     // This thread is ready, open_hid_device() can carry on
-    port->u.hid->thread_ret = 1;
-    pthread_cond_signal(&port->u.hid->cond);
-    pthread_mutex_unlock(&port->u.hid->mutex);
+    hid->thread_ret = 1;
+    pthread_cond_signal(&hid->cond);
+    pthread_mutex_unlock(&hid->mutex);
 
     CFRunLoopRun();
 
-    IOHIDDeviceUnscheduleFromRunLoop(port->u.hid->hid_ref, port->u.hid->thread_loop,
-                                     kCFRunLoopCommonModes);
+    IOHIDDeviceUnscheduleFromRunLoop(hid->hid_ref, hid->thread_loop, kCFRunLoopCommonModes);
 
-    pthread_mutex_lock(&port->u.hid->mutex);
-    port->u.hid->thread_loop = NULL;
-    pthread_mutex_unlock(&port->u.hid->mutex);
+    pthread_mutex_lock(&hid->mutex);
+    hid->thread_loop = NULL;
+    pthread_mutex_unlock(&hid->mutex);
 
     return NULL;
 
 error:
-    port->u.hid->thread_ret = r;
-    pthread_cond_signal(&port->u.hid->cond);
-    pthread_mutex_unlock(&port->u.hid->mutex);
+    hid->thread_ret = r;
+    pthread_cond_signal(&hid->cond);
+    pthread_mutex_unlock(&hid->mutex);
     return NULL;
 }
 
@@ -5026,97 +5074,94 @@ static bool get_hid_device_property_number(IOHIDDeviceRef ref, CFStringRef prop,
     if (!data || CFGetTypeID(data) != CFNumberGetTypeID())
         return false;
 
-    return CFNumberGetValue(data, type, rn);
+    return CFNumberGetValue((CFNumberRef)data, type, rn);
 }
 
 int _hs_darwin_open_hid_port(hs_device *dev, hs_port_mode mode, hs_port **rport)
 {
     hs_port *port;
+    struct _hs_hid_darwin *hid;
     kern_return_t kret;
     int r;
 
-    port = calloc(1, _HS_ALIGN_SIZE_FOR_TYPE(sizeof(*port), struct _hs_hid_darwin) +
-                  sizeof(struct _hs_hid_darwin));
+    port = (hs_port *)calloc(1, _HS_ALIGN_SIZE_FOR_TYPE(sizeof(*port), struct _hs_hid_darwin) +
+                                sizeof(struct _hs_hid_darwin));
     if (!port) {
         r = hs_error(HS_ERROR_MEMORY, NULL);
         goto error;
     }
     port->type = dev->type;
-    port->u.hid->poll_pipe[0] = -1;
-    port->u.hid->poll_pipe[1] = -1;
-
     port->u.hid = (struct _hs_hid_darwin *)((char *)port +
                                             _HS_ALIGN_SIZE_FOR_TYPE(sizeof(*port), struct _hs_hid_darwin));
+    hid = port->u.hid;
+    hid->poll_pipe[0] = -1;
+    hid->poll_pipe[1] = -1;
+
     port->mode = mode;
     port->path = dev->path;
     port->dev = hs_device_ref(dev);
 
-    _hs_list_init(&port->u.hid->reports);
-    _hs_list_init(&port->u.hid->free_reports);
-
-    port->u.hid->service = IORegistryEntryFromPath(kIOMasterPortDefault, dev->path);
-    if (!port->u.hid->service) {
+    hid->service = IORegistryEntryFromPath(kIOMasterPortDefault, dev->path);
+    if (!hid->service) {
         r = hs_error(HS_ERROR_NOT_FOUND, "Device '%s' not found", dev->path);
         goto error;
     }
 
-    port->u.hid->hid_ref = IOHIDDeviceCreate(kCFAllocatorDefault, port->u.hid->service);
-    if (!port->u.hid->hid_ref) {
+    hid->hid_ref = IOHIDDeviceCreate(kCFAllocatorDefault, hid->service);
+    if (!hid->hid_ref) {
         r = hs_error(HS_ERROR_NOT_FOUND, "Device '%s' not found", dev->path);
         goto error;
     }
 
-    kret = IOHIDDeviceOpen(port->u.hid->hid_ref, 0);
+    kret = IOHIDDeviceOpen(hid->hid_ref, 0);
     if (kret != kIOReturnSuccess) {
         r = hs_error(HS_ERROR_SYSTEM, "Failed to open HID device '%s'", dev->path);
         goto error;
     }
 
-    IOHIDDeviceRegisterRemovalCallback(port->u.hid->hid_ref, hid_removal_callback, port);
+    IOHIDDeviceRegisterRemovalCallback(hid->hid_ref, hid_removal_callback, port);
 
     if (mode & HS_PORT_MODE_READ) {
-        r = get_hid_device_property_number(port->u.hid->hid_ref, CFSTR(kIOHIDMaxInputReportSizeKey),
-                                           kCFNumberSInt32Type, &port->u.hid->read_size);
+        r = get_hid_device_property_number(hid->hid_ref, CFSTR(kIOHIDMaxInputReportSizeKey),
+                                           kCFNumberSInt32Type, &hid->read_size);
         if (!r) {
             r = hs_error(HS_ERROR_SYSTEM, "HID device '%s' has no valid report size key", dev->path);
             goto error;
         }
-        port->u.hid->read_buf = malloc(port->u.hid->read_size);
-        if (!port->u.hid->read_buf) {
+        hid->read_buf = (uint8_t *)malloc(hid->read_size);
+        if (!hid->read_buf) {
             r = hs_error(HS_ERROR_MEMORY, NULL);
             goto error;
         }
 
-        IOHIDDeviceRegisterInputReportCallback(port->u.hid->hid_ref, port->u.hid->read_buf,
-                                               (CFIndex)port->u.hid->read_size, hid_report_callback, port);
+        IOHIDDeviceRegisterInputReportCallback(hid->hid_ref, hid->read_buf,
+                                               (CFIndex)hid->read_size, hid_report_callback, port);
 
-        r = pipe(port->u.hid->poll_pipe);
+        r = pipe(hid->poll_pipe);
         if (r < 0) {
             r = hs_error(HS_ERROR_SYSTEM, "pipe() failed: %s", strerror(errno));
             goto error;
         }
-        fcntl(port->u.hid->poll_pipe[0], F_SETFL,
-                fcntl(port->u.hid->poll_pipe[0], F_GETFL, 0) | O_NONBLOCK);
-        fcntl(port->u.hid->poll_pipe[1], F_SETFL,
-                fcntl(port->u.hid->poll_pipe[1], F_GETFL, 0) | O_NONBLOCK);
+        fcntl(hid->poll_pipe[0], F_SETFL, fcntl(hid->poll_pipe[0], F_GETFL, 0) | O_NONBLOCK);
+        fcntl(hid->poll_pipe[1], F_SETFL, fcntl(hid->poll_pipe[1], F_GETFL, 0) | O_NONBLOCK);
 
-        r = pthread_mutex_init(&port->u.hid->mutex, NULL);
+        r = pthread_mutex_init(&hid->mutex, NULL);
         if (r < 0) {
             r = hs_error(HS_ERROR_SYSTEM, "pthread_mutex_init() failed: %s", strerror(r));
             goto error;
         }
-        port->u.hid->mutex_init = true;
+        hid->mutex_init = true;
 
-        r = pthread_cond_init(&port->u.hid->cond, NULL);
+        r = pthread_cond_init(&hid->cond, NULL);
         if (r < 0) {
             r = hs_error(HS_ERROR_SYSTEM, "pthread_cond_init() failed: %s", strerror(r));
             goto error;
         }
-        port->u.hid->cond_init = true;
+        hid->cond_init = true;
 
-        pthread_mutex_lock(&port->u.hid->mutex);
+        pthread_mutex_lock(&hid->mutex);
 
-        r = pthread_create(&port->u.hid->read_thread, NULL, hid_read_thread, port);
+        r = pthread_create(&hid->read_thread, NULL, hid_read_thread, port);
         if (r) {
             r = hs_error(HS_ERROR_SYSTEM, "pthread_create() failed: %s", strerror(r));
             goto error;
@@ -5124,11 +5169,11 @@ int _hs_darwin_open_hid_port(hs_device *dev, hs_port_mode mode, hs_port **rport)
 
         /* Barriers are great for this, but OSX doesn't have those... And since it's the only
            place we would use them, it's probably not worth it to have a custom implementation. */
-        while (!port->u.hid->thread_ret)
-            pthread_cond_wait(&port->u.hid->cond, &port->u.hid->mutex);
-        r = port->u.hid->thread_ret;
-        port->u.hid->thread_ret = 0;
-        pthread_mutex_unlock(&port->u.hid->mutex);
+        while (!hid->thread_ret)
+            pthread_cond_wait(&hid->cond, &hid->mutex);
+        r = hid->thread_ret;
+        hid->thread_ret = 0;
+        pthread_mutex_unlock(&hid->mutex);
         if (r < 0)
             goto error;
     }
@@ -5144,42 +5189,44 @@ error:
 void _hs_darwin_close_hid_port(hs_port *port)
 {
     if (port) {
-        if (port->u.hid->shutdown_source) {
-            pthread_mutex_lock(&port->u.hid->mutex);
+        struct _hs_hid_darwin *hid = port->u.hid;
 
-            if (port->u.hid->thread_loop) {
-                CFRunLoopSourceSignal(port->u.hid->shutdown_source);
-                CFRunLoopWakeUp(port->u.hid->thread_loop);
+        if (hid->shutdown_source) {
+            pthread_mutex_lock(&hid->mutex);
+
+            if (hid->thread_loop) {
+                CFRunLoopSourceSignal(hid->shutdown_source);
+                CFRunLoopWakeUp(hid->thread_loop);
             }
 
-            pthread_mutex_unlock(&port->u.hid->mutex);
-            pthread_join(port->u.hid->read_thread, NULL);
+            pthread_mutex_unlock(&hid->mutex);
+            pthread_join(hid->read_thread, NULL);
 
-            CFRelease(port->u.hid->shutdown_source);
+            CFRelease(hid->shutdown_source);
         }
 
-        if (port->u.hid->cond_init)
-            pthread_cond_destroy(&port->u.hid->cond);
-        if (port->u.hid->mutex_init)
-            pthread_mutex_destroy(&port->u.hid->mutex);
+        if (hid->cond_init)
+            pthread_cond_destroy(&hid->cond);
+        if (hid->mutex_init)
+            pthread_mutex_destroy(&hid->mutex);
 
-        _hs_list_splice(&port->u.hid->free_reports, &port->u.hid->reports);
-        _hs_list_foreach(cur, &port->u.hid->free_reports) {
-            struct hid_report *report = _hs_container_of(cur, struct hid_report, list);
-            free(report);
+        for (size_t i = 0; i < hid->reports.count; i++) {
+            struct hid_report *report = &hid->reports.values[i];
+            free(report->data);
         }
+        _hs_array_release(&hid->reports);
 
-        close(port->u.hid->poll_pipe[0]);
-        close(port->u.hid->poll_pipe[1]);
+        close(hid->poll_pipe[0]);
+        close(hid->poll_pipe[1]);
 
-        free(port->u.hid->read_buf);
+        free(hid->read_buf);
 
-        if (port->u.hid->hid_ref) {
-            IOHIDDeviceClose(port->u.hid->hid_ref, 0);
-            CFRelease(port->u.hid->hid_ref);
+        if (hid->hid_ref) {
+            IOHIDDeviceClose(hid->hid_ref, 0);
+            CFRelease(hid->hid_ref);
         }
-        if (port->u.hid->service)
-            IOObjectRelease(port->u.hid->service);
+        if (hid->service)
+            IOObjectRelease(hid->service);
 
         hs_device_unref(port->dev);
     }
@@ -5200,10 +5247,11 @@ ssize_t hs_hid_read(hs_port *port, uint8_t *buf, size_t size, int timeout)
     assert(buf);
     assert(size);
 
+    struct _hs_hid_darwin *hid = port->u.hid;
     struct hid_report *report;
     ssize_t r;
 
-    if (port->u.hid->device_removed)
+    if (hid->device_removed)
         return hs_error(HS_ERROR_IO, "Device '%s' was removed", port->path);
 
     if (timeout) {
@@ -5211,7 +5259,7 @@ ssize_t hs_hid_read(hs_port *port, uint8_t *buf, size_t size, int timeout)
         uint64_t start;
 
         pfd.events = POLLIN;
-        pfd.fd = port->u.hid->poll_pipe[0];
+        pfd.fd = hid->poll_pipe[0];
 
         start = hs_millis();
 restart:
@@ -5226,44 +5274,41 @@ restart:
             return 0;
     }
 
-    pthread_mutex_lock(&port->u.hid->mutex);
+    pthread_mutex_lock(&hid->mutex);
 
-    if (port->u.hid->thread_ret < 0) {
-        r = port->u.hid->thread_ret;
-        port->u.hid->thread_ret = 0;
-
-        goto reset;
+    if (hid->thread_ret < 0) {
+        r = hid->thread_ret;
+        hid->thread_ret = 0;
+        goto cleanup;
     }
-
-    report = _hs_list_get_first(&port->u.hid->reports, struct hid_report, list);
-    if (!report) {
+    if (!hid->reports.count) {
         r = 0;
         goto cleanup;
     }
 
+    report = &hid->reports.values[0];
     if (size > report->size)
         size = report->size;
     memcpy(buf, report->data, size);
     r = (ssize_t)size;
 
-    _hs_list_remove(&report->list);
-    _hs_list_add(&port->u.hid->free_reports, &report->list);
-
-reset:
-    if (_hs_list_is_empty(&port->u.hid->reports))
-        reset_device_event(port);
+    // Circular buffer would be more appropriate. Later.
+    _hs_array_deque(&hid->reports, 1);
 
 cleanup:
-    pthread_mutex_unlock(&port->u.hid->mutex);
+    if (!hid->reports.count)
+        reset_hid_poll_handle(hid);
+    pthread_mutex_unlock(&hid->mutex);
     return r;
 }
 
 static ssize_t send_report(hs_port *port, IOHIDReportType type, const uint8_t *buf, size_t size)
 {
+    struct _hs_hid_darwin *hid = port->u.hid;
     uint8_t report;
     kern_return_t kret;
 
-    if (port->u.hid->device_removed)
+    if (hid->device_removed)
         return hs_error(HS_ERROR_IO, "Device '%s' was removed", port->path);
 
     if (size < 2)
@@ -5280,7 +5325,7 @@ static ssize_t send_report(hs_port *port, IOHIDReportType type, const uint8_t *b
        close the write side to drop out of IOHIDDeviceSetReport() after a few seconds? Or maybe
        we can call IOHIDDeviceSetReport() in another thread and kill it, but I don't trust OSX
        to behave well in that case. The HID API does like to crash OSX for no reason. */
-    kret = IOHIDDeviceSetReport(port->u.hid->hid_ref, type, report, buf, (CFIndex)size);
+    kret = IOHIDDeviceSetReport(hid->hid_ref, type, report, buf, (CFIndex)size);
     if (kret != kIOReturnSuccess)
         return hs_error(HS_ERROR_IO, "I/O error while writing to '%s'", port->path);
 
@@ -5305,14 +5350,15 @@ ssize_t hs_hid_get_feature_report(hs_port *port, uint8_t report_id, uint8_t *buf
     assert(buf);
     assert(size);
 
+    struct _hs_hid_darwin *hid = port->u.hid;
     CFIndex len;
     kern_return_t kret;
 
-    if (port->u.hid->device_removed)
+    if (hid->device_removed)
         return hs_error(HS_ERROR_IO, "Device '%s' was removed", port->path);
 
     len = (CFIndex)size - 1;
-    kret = IOHIDDeviceGetReport(port->u.hid->hid_ref, kIOHIDReportTypeFeature, report_id,
+    kret = IOHIDDeviceGetReport(hid->hid_ref, kIOHIDReportTypeFeature, report_id,
                                 buf + 1, &len);
     if (kret != kIOReturnSuccess)
         return hs_error(HS_ERROR_IO, "IOHIDDeviceGetReport() failed on '%s'", port->path);
@@ -5347,7 +5393,6 @@ ssize_t hs_hid_send_feature_report(hs_port *port, const uint8_t *buf, size_t siz
 #include <unistd.h>
 // #include "device_priv.h"
 // #include "filter_priv.h"
-// #include "list.h"
 // #include "monitor_priv.h"
 // #include "platform.h"
 
@@ -5373,13 +5418,6 @@ struct device_class {
     const char *new_stack;
 
     hs_device_type type;
-};
-
-struct usb_controller {
-    _hs_list_head list;
-
-    uint8_t index;
-    io_string_t path;
 };
 
 struct service_aggregate {
@@ -5424,15 +5462,16 @@ static int get_ioregistry_value_string(io_service_t service, CFStringRef prop, c
         goto cleanup;
     }
 
-    size = CFStringGetMaximumSizeForEncoding(CFStringGetLength(data), kCFStringEncodingUTF8) + 1;
+    size = CFStringGetMaximumSizeForEncoding(CFStringGetLength((CFStringRef)data),
+                                             kCFStringEncodingUTF8) + 1;
 
-    s = malloc((size_t)size);
+    s = (char *)malloc((size_t)size);
     if (!s) {
         r = hs_error(HS_ERROR_MEMORY, NULL);
         goto cleanup;
     }
 
-    r = CFStringGetCString(data, s, size, kCFStringEncodingUTF8);
+    r = CFStringGetCString((CFStringRef)data, s, size, kCFStringEncodingUTF8);
     if (!r) {
         r = 0;
         goto cleanup;
@@ -5458,7 +5497,7 @@ static bool get_ioregistry_value_number(io_service_t service, CFStringRef prop, 
         goto cleanup;
     }
 
-    r = CFNumberGetValue(data, type, rn);
+    r = CFNumberGetValue((CFNumberRef)data, type, rn);
 cleanup:
     if (data)
         CFRelease(data);
@@ -5656,7 +5695,7 @@ static int process_darwin_device(io_service_t service, hs_device **rdev)
         goto cleanup;
     }
 
-    dev = calloc(1, sizeof(*dev));
+    dev = (hs_device *)calloc(1, sizeof(*dev));
     if (!dev) {
         r = hs_error(HS_ERROR_MEMORY, NULL);
         goto cleanup;
@@ -5723,7 +5762,7 @@ static int process_iterator_devices(io_iterator_t it, const _hs_filter *filter,
 
 static int attached_callback(hs_device *dev, void *udata)
 {
-    hs_monitor *monitor = udata;
+    hs_monitor *monitor = (hs_monitor *)udata;
 
     if (!_hs_filter_match_device(&monitor->filter, dev))
         return 0;
@@ -5732,7 +5771,7 @@ static int attached_callback(hs_device *dev, void *udata)
 
 static void darwin_devices_attached(void *udata, io_iterator_t it)
 {
-    hs_monitor *monitor = udata;
+    hs_monitor *monitor = (hs_monitor *)udata;
 
     monitor->notify_ret = process_iterator_devices(it, &monitor->filter,
                                                    attached_callback, monitor);
@@ -5740,7 +5779,7 @@ static void darwin_devices_attached(void *udata, io_iterator_t it)
 
 static void darwin_devices_detached(void *udata, io_iterator_t it)
 {
-    hs_monitor *monitor = udata;
+    hs_monitor *monitor = (hs_monitor *)udata;
 
     io_service_t service;
     while ((service = IOIteratorNext(it))) {
@@ -5766,7 +5805,7 @@ struct enumerate_enumerate_context {
 
 static int enumerate_enumerate_callback(hs_device *dev, void *udata)
 {
-    struct enumerate_enumerate_context *ctx = udata;
+    struct enumerate_enumerate_context *ctx = (struct enumerate_enumerate_context *)udata;
 
     _hs_device_log(dev, "Enumerate");
     return (*ctx->f)(dev, ctx->udata);
@@ -5846,7 +5885,7 @@ int hs_monitor_new(const hs_match *matches, unsigned int count, hs_monitor **rmo
     kern_return_t kret;
     int r;
 
-    monitor = calloc(1, sizeof(*monitor));
+    monitor = (hs_monitor *)calloc(1, sizeof(*monitor));
     if (!monitor) {
         r = hs_error(HS_ERROR_MEMORY, NULL);
         goto error;
@@ -5933,7 +5972,7 @@ hs_handle hs_monitor_get_poll_handle(const hs_monitor *monitor)
 
 static int start_enumerate_callback(hs_device *dev, void *udata)
 {
-    hs_monitor *monitor = udata;
+    hs_monitor *monitor = (hs_monitor *)udata;
 
     if (!_hs_filter_match_device(&monitor->filter, dev))
         return 0;
@@ -6628,7 +6667,7 @@ int _hs_open_file_port(hs_device *dev, hs_port_mode mode, hs_port **rport)
     int fd_flags;
     int r;
 
-    port = calloc(1, sizeof(*port));
+    port = (hs_port *)calloc(1, sizeof(*port));
     if (!port) {
         r = hs_error(HS_ERROR_MEMORY, NULL);
         goto error;
@@ -6826,7 +6865,7 @@ restart:
                 free(port->u.file.read_buf);
                 port->u.file.read_buf_size = 0;
 
-                port->u.file.read_buf = malloc(size + 1);
+                port->u.file.read_buf = (uint8_t *)malloc(size + 1);
                 if (!port->u.file.read_buf)
                     return hs_error(HS_ERROR_MEMORY, NULL);
                 port->u.file.read_buf_size = size + 1;
@@ -7257,7 +7296,7 @@ static int read_device_information(struct udev_device *udev_dev, hs_device **rde
         goto cleanup;
     }
 
-    dev = calloc(1, sizeof(*dev));
+    dev = (hs_device *)calloc(1, sizeof(*dev));
     if (!dev) {
         r = hs_error(HS_ERROR_MEMORY, NULL);
         goto cleanup;
@@ -7401,7 +7440,7 @@ struct enumerate_enumerate_context {
 
 static int enumerate_enumerate_callback(hs_device *dev, void *udata)
 {
-    struct enumerate_enumerate_context *ctx = udata;
+    struct enumerate_enumerate_context *ctx = (struct enumerate_enumerate_context *)udata;
 
     _hs_device_log(dev, "Enumerate");
     return (*ctx->f)(dev, ctx->udata);
@@ -7440,7 +7479,7 @@ int hs_monitor_new(const hs_match *matches, unsigned int count, hs_monitor **rmo
     hs_monitor *monitor;
     int r;
 
-    monitor = calloc(1, sizeof(*monitor));
+    monitor = (hs_monitor *)calloc(1, sizeof(*monitor));
     if (!monitor) {
         r = hs_error(HS_ERROR_MEMORY, NULL);
         goto error;
@@ -7489,7 +7528,7 @@ void hs_monitor_free(hs_monitor *monitor)
 
 static int monitor_enumerate_callback(hs_device *dev, void *udata)
 {
-    hs_monitor *monitor = udata;
+    hs_monitor *monitor = (hs_monitor *)udata;
 
     if (!_hs_filter_match_device(&monitor->filter, dev))
         return 0;
