@@ -28,13 +28,6 @@
 
    Other systems are not supported at the moment. */
 
-#if defined(HS_IMPLEMENTATION) && defined(_MSC_VER)
-    #pragma comment(lib, "user32.lib")
-    #pragma comment(lib, "advapi32.lib")
-    #pragma comment(lib, "setupapi.lib")
-    #pragma comment(lib, "hid.lib")
-#endif
-
 // common.h
 // ------------------------------------
 
@@ -1473,7 +1466,16 @@ HS_END_C
 #endif
 
 
+#endif
+
 #ifdef HS_IMPLEMENTATION
+    #if defined(_MSC_VER)
+        #pragma comment(lib, "user32.lib")
+        #pragma comment(lib, "advapi32.lib")
+        #pragma comment(lib, "setupapi.lib")
+        #pragma comment(lib, "hid.lib")
+    #endif
+
 // compat_priv.h
 // ------------------------------------
 
@@ -4258,7 +4260,7 @@ int hs_monitor_refresh(hs_monitor *monitor, hs_enumerate_func *f, void *udata)
            own array and let the background thread work and process Win32 events. */
         EnterCriticalSection(&monitor->events_lock);
         monitor->refresh_events = monitor->events;
-        monitor->events = (event_array){0};
+        memset(&monitor->events, 0, sizeof(monitor->events));
         r = monitor->thread_ret;
         monitor->thread_ret = 0;
         LeaveCriticalSection(&monitor->events_lock);
@@ -8193,6 +8195,4 @@ ssize_t hs_serial_write(hs_port *port, const uint8_t *buf, size_t size, int time
     #else
         #error "Platform not supported"
     #endif
-#endif
-
 #endif
