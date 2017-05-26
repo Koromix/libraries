@@ -52,7 +52,7 @@ HS_BEGIN_C
 typedef struct hs_device hs_device;
 typedef struct hs_monitor hs_monitor;
 typedef struct hs_port hs_port;
-typedef struct hs_match hs_match;
+typedef struct hs_match_spec hs_match_spec;
 
 /**
  * @defgroup misc Miscellaneous
@@ -154,8 +154,10 @@ typedef enum hs_error_code {
     HS_ERROR_ACCESS        = -3,
     /** Input/output error. */
     HS_ERROR_IO            = -4,
+    /** Parse error. */
+    HS_ERROR_PARSE         = -5,
     /** Generic system error. */
-    HS_ERROR_SYSTEM        = -5
+    HS_ERROR_SYSTEM        = -6
 } hs_error_code;
 
 typedef void hs_log_handler_func(hs_log_level level, int err, const char *msg, void *udata);
@@ -367,12 +369,23 @@ struct _hs_array {
         if ((Array)->count <= (Array)->allocated / 2) \
             _hs_array_shrink(Array); \
     } while (0)
-#define _hs_array_deque(Array, Count) \
+#define _hs_array_remove(Array, Offset, Count) \
     do { \
+        size_t _HS_UNIQUE_ID(start) = (Offset); \
         size_t _HS_UNIQUE_ID(count) = (Count); \
-        memmove((Array)->values, (Array)->values + _HS_UNIQUE_ID(count), \
-                ((Array)->count - _HS_UNIQUE_ID(count)) * sizeof(*(Array)->values)); \
+        size_t _HS_UNIQUE_ID(end) = _HS_UNIQUE_ID(start) + _HS_UNIQUE_ID(count); \
+        memmove((Array)->values + _HS_UNIQUE_ID(start), \
+                (Array)->values + _HS_UNIQUE_ID(end), \
+                ((Array)->count - _HS_UNIQUE_ID(end)) * sizeof(*(Array)->values)); \
         _hs_array_pop((Array), _HS_UNIQUE_ID(count)); \
+    } while (0)
+
+#define _hs_array_move(Src, Dest) \
+    do { \
+        (Dest)->values = (Src)->values; \
+        (Dest)->count = (Src)->count; \
+        (Dest)->allocated = (Src)->allocated; \
+        memset((Src), 0, sizeof(*(Src))); \
     } while (0)
 
 void _hs_array_release_(struct _hs_array *array);
@@ -561,6 +574,9 @@ struct hs_device {
     char *serial_number_string;
     /** Device interface number. */
     uint8_t iface_number;
+
+    /** Match pointer, copied from udata in @ref hs_match_spec. */
+    void *match_udata;
 
     /** Contains type-specific information, see below. */
     union {
@@ -790,21 +806,21 @@ HS_BEGIN_C
 
 /**
  * @ingroup match
- * @brief Device match, use the @ref HS_MATCH_TYPE "dedicated macros" for convenience.
+ * @brief Device match specifier, use the @ref HS_MATCH_TYPE "dedicated macros" for convenience.
  *
  * Here is a short example to enumerate all serial devices and HID devices with a specific
  * VID:PID pair.
  *
  * @code{.c}
- * const hs_match matches[] = {
- *     HS_MATCH_TYPE(HS_DEVICE_TYPE_SERIAL),
- *     HS_MATCH_TYPE_VID_PID(HS_DEVICE_TYPE_HID, 0x16C0, 0x478)
+ * const hs_match_spec specs[] = {
+ *     HS_MATCH_TYPE(HS_DEVICE_TYPE_SERIAL, NULL),
+ *     HS_MATCH_TYPE_VID_PID(HS_DEVICE_TYPE_HID, 0x16C0, 0x478, NULL)
  * };
  *
- * r = hs_enumerate(matches, sizeof(matches) / sizeof(*matches), device_callback, NULL);
+ * r = hs_enumerate(specs, sizeof(specs) / sizeof(*specs), device_callback, NULL);
  * @endcode
  */
-struct hs_match {
+struct hs_match_spec {
     /** Device type @ref hs_device_type or 0 to match all types. */
     unsigned int type;
 
@@ -813,30 +829,43 @@ struct hs_match {
     /** Device product ID or 0 to match all. */
     uint16_t pid;
 
-    /** Device path or NULL to match all. */
-    const char *path;
+    /** This value will be copied to dev->match_udata, see @ref hs_device. */
+    void *udata;
 };
 
 /**
  * @ingroup match
  * @brief Match a specific device type, see @ref hs_device_type.
  */
-#define HS_MATCH_TYPE(type) {(type), 0, 0, NULL}
+#define HS_MATCH_TYPE(type, udata) {(type), 0, 0, (udata)}
 /**
  * @ingroup match
  * @brief Match devices with corresponding VID:PID pair.
  */
-#define HS_MATCH_VID_PID(vid, pid) {0, (vid), (pid), NULL}
+#define HS_MATCH_VID_PID(vid, pid, udata) {0, (vid), (pid), (udata)}
 /**
  * @ingroup match
  * @brief Match devices with corresponding @ref hs_device_type and VID:PID pair.
  */
-#define HS_MATCH_TYPE_VID_PID(type, vid, pid) {(type), (vid), (pid), NULL}
+#define HS_MATCH_TYPE_VID_PID(type, vid, pid, udata) {(type), (vid), (pid), (udata)}
+
 /**
  * @ingroup match
- * @brief Match device with corresponding @ref hs_device_type and device path (e.g. COM1).
+ * @brief Create device match from human-readable string.
+ *
+ * Match string  | Details
+ * ------------- | -------------------------------------------------
+ * 0:0           | Match all devices
+ * 0:0/serial    | Match all serial devices
+ * abcd:0123/hid | Match HID devices with VID:PID pair 0xABCD:0x0123
+ * 0123:abcd     | Match devices with VID:PID pair 0x0123:0xABCD
+ *
+ * @param      str    Human-readable match string.
+ * @param[out] rmatch A pointer to the variable that receives the device match specifier,
+ *     it will stay unchanged if the function fails.
+ * @return This function returns 0 on success, or a negative @ref hs_error_code value.
  */
-#define HS_MATCH_TYPE_PATH(type, path) {(type), 0, 0, (path)}
+int hs_match_parse(const char *str, hs_match_spec *rspec);
 
 HS_END_C
 
@@ -903,10 +932,10 @@ typedef int hs_enumerate_func(struct hs_device *dev, void *udata);
  * @return This function returns 0 on success, or a negative @ref hs_error_code value. If the
  *     callback returns a non-zero value, the enumeration is interrupted and the value is returned.
  *
- * @sa hs_match Match specific devices.
+ * @sa hs_match_spec Match specific devices.
  * @sa hs_enumerate_func() for more information about the callback.
  */
-int hs_enumerate(const hs_match *matches, unsigned int count, hs_enumerate_func *f, void *udata);
+int hs_enumerate(const hs_match_spec *matches, unsigned int count, hs_enumerate_func *f, void *udata);
 
 /**
  * @ingroup monitor
@@ -920,7 +949,7 @@ int hs_enumerate(const hs_match *matches, unsigned int count, hs_enumerate_func 
  * @return This function returns 1 if a device is found, 0 if not or a negative @ref hs_error_code
  *     value.
  */
-int hs_find(const hs_match *matches, unsigned int count, struct hs_device **rdev);
+int hs_find(const hs_match_spec *matches, unsigned int count, struct hs_device **rdev);
 
 /**
  * @{
@@ -940,7 +969,7 @@ int hs_find(const hs_match *matches, unsigned int count, struct hs_device **rdev
  *
  * @sa hs_monitor_free()
  */
-int hs_monitor_new(const hs_match *matches, unsigned int count, hs_monitor **rmonitor);
+int hs_monitor_new(const hs_match_spec *matches, unsigned int count, hs_monitor **rmonitor);
 /**
  * @ingroup monitor
  * @brief Close a device monitor.
@@ -1619,28 +1648,30 @@ hs_handle _hs_darwin_get_hid_port_poll_handle(const hs_port *port);
 
 #endif
 
-// filter_priv.h
+// match_priv.h
 // ------------------------------------
 
-#ifndef _HS_FILTER_PRIV_H
-#define _HS_FILTER_PRIV_H
+#ifndef _HS_MATCH_PRIV_H
+#define _HS_MATCH_PRIV_H
 
 // #include "common_priv.h"
 // #include "device.h"
 // #include "match.h"
 
-typedef struct _hs_filter {
-    hs_match *matches;
-    unsigned int count;
+typedef struct _hs_match_helper {
+    hs_match_spec *specs;
+    unsigned int specs_count;
 
     uint32_t types;
-} _hs_filter;
+} _hs_match_helper;
 
-int _hs_filter_init(_hs_filter *filter, const hs_match *matches, unsigned int count);
-void _hs_filter_release(_hs_filter *filter);
+int _hs_match_helper_init(_hs_match_helper *helper, const hs_match_spec *specs,
+                          unsigned int specs_count);
+void _hs_match_helper_release(_hs_match_helper *helper);
 
-bool _hs_filter_match_device(const _hs_filter *filter, const hs_device *dev);
-bool _hs_filter_has_type(const _hs_filter *filter, hs_device_type type);
+bool _hs_match_helper_match(const _hs_match_helper *helper, const hs_device *dev,
+                            void **rmatch_udata);
+bool _hs_match_helper_has_type(const _hs_match_helper *helper, hs_device_type type);
 
 #endif
 
@@ -1675,16 +1706,12 @@ static const char *generic_message(int err)
         return "Success";
 
     switch ((hs_error_code)err) {
-    case HS_ERROR_MEMORY:
-        return "Memory error";
-    case HS_ERROR_NOT_FOUND:
-        return "Not found";
-    case HS_ERROR_ACCESS:
-        return "Permission error";
-    case HS_ERROR_IO:
-        return "I/O error";
-    case HS_ERROR_SYSTEM:
-        return "System error";
+        case HS_ERROR_MEMORY: { return "Memory error"; } break;
+        case HS_ERROR_NOT_FOUND: { return "Not found"; } break;
+        case HS_ERROR_ACCESS: { return "Permission error"; } break;
+        case HS_ERROR_IO: { return "I/O error"; } break;
+        case HS_ERROR_PARSE: { return "Parse error"; } break;
+        case HS_ERROR_SYSTEM: { return "System error"; } break;
     }
 
     return "Unknown error";
@@ -1947,27 +1974,27 @@ void hs_device_unref(hs_device *dev)
 void _hs_device_log(const hs_device *dev, const char *verb)
 {
     switch (dev->type) {
-    case HS_DEVICE_TYPE_SERIAL:
-        hs_log(HS_LOG_DEBUG, "%s serial device '%s' on iface %u\n"
-                             "  - USB VID/PID = %04x:%04x, USB location = %s\n"
-                             "  - USB manufacturer = %s, product = %s, S/N = %s",
-               verb, dev->key, dev->iface_number, dev->vid, dev->pid, dev->location,
-               dev->manufacturer_string ? dev->manufacturer_string : "(none)",
-               dev->product_string ? dev->product_string : "(none)",
-               dev->serial_number_string ? dev->serial_number_string : "(none)");
-        break;
+        case HS_DEVICE_TYPE_SERIAL: {
+            hs_log(HS_LOG_DEBUG, "%s serial device '%s' on iface %u\n"
+                                 "  - USB VID/PID = %04x:%04x, USB location = %s\n"
+                                 "  - USB manufacturer = %s, product = %s, S/N = %s",
+                   verb, dev->key, dev->iface_number, dev->vid, dev->pid, dev->location,
+                   dev->manufacturer_string ? dev->manufacturer_string : "(none)",
+                   dev->product_string ? dev->product_string : "(none)",
+                   dev->serial_number_string ? dev->serial_number_string : "(none)");
+        } break;
 
-    case HS_DEVICE_TYPE_HID:
-        hs_log(HS_LOG_DEBUG, "%s HID device '%s' on iface %u\n"
-                             "  - USB VID/PID = %04x:%04x, USB location = %s\n"
-                             "  - USB manufacturer = %s, product = %s, S/N = %s\n"
-                             "  - HID usage page = 0x%x, HID usage = 0x%x",
-               verb, dev->key, dev->iface_number, dev->vid, dev->pid, dev->location,
-               dev->manufacturer_string ? dev->manufacturer_string : "(none)",
-               dev->product_string ? dev->product_string : "(none)",
-               dev->serial_number_string ? dev->serial_number_string : "(none)",
-               dev->u.hid.usage_page, dev->u.hid.usage);
-        break;
+        case HS_DEVICE_TYPE_HID: {
+            hs_log(HS_LOG_DEBUG, "%s HID device '%s' on iface %u\n"
+                                 "  - USB VID/PID = %04x:%04x, USB location = %s\n"
+                                 "  - USB manufacturer = %s, product = %s, S/N = %s\n"
+                                 "  - HID usage page = 0x%x, HID usage = 0x%x",
+                   verb, dev->key, dev->iface_number, dev->vid, dev->pid, dev->location,
+                   dev->manufacturer_string ? dev->manufacturer_string : "(none)",
+                   dev->product_string ? dev->product_string : "(none)",
+                   dev->serial_number_string ? dev->serial_number_string : "(none)",
+                   dev->u.hid.usage_page, dev->u.hid.usage);
+        } break;
     }
 }
 
@@ -1980,14 +2007,17 @@ int hs_port_open(hs_device *dev, hs_port_mode mode, hs_port **rport)
         return hs_error(HS_ERROR_NOT_FOUND, "Device '%s' is not connected", dev->path);
 
     switch (dev->type) {
-    case HS_DEVICE_TYPE_HID:
+        case HS_DEVICE_TYPE_HID: {
 #ifdef __APPLE__
-        return _hs_darwin_open_hid_port(dev, mode, rport);
+            return _hs_darwin_open_hid_port(dev, mode, rport);
 #else
-        return _hs_open_file_port(dev, mode, rport);
+            return _hs_open_file_port(dev, mode, rport);
 #endif
-    case HS_DEVICE_TYPE_SERIAL:
-        return _hs_open_file_port(dev, mode, rport);
+        } break;
+
+        case HS_DEVICE_TYPE_SERIAL: {
+            return _hs_open_file_port(dev, mode, rport);
+        } break;
     }
 
     assert(false);
@@ -2000,16 +2030,19 @@ void hs_port_close(hs_port *port)
         return;
 
     switch (port->type) {
-    case HS_DEVICE_TYPE_HID:
+        case HS_DEVICE_TYPE_HID: {
 #ifdef __APPLE__
-        _hs_darwin_close_hid_port(port);
+            _hs_darwin_close_hid_port(port);
 #else
-        _hs_close_file_port(port);
+            _hs_close_file_port(port);
 #endif
-        return;
-    case HS_DEVICE_TYPE_SERIAL:
-        _hs_close_file_port(port);
-        return;
+            return;
+        } break;
+
+        case HS_DEVICE_TYPE_SERIAL: {
+            _hs_close_file_port(port);
+            return;
+        } break;
     }
 
     assert(false);
@@ -2026,123 +2059,134 @@ hs_handle hs_port_get_poll_handle(const hs_port *port)
     assert(port);
 
     switch (port->type) {
-    case HS_DEVICE_TYPE_HID:
+        case HS_DEVICE_TYPE_HID: {
 #ifdef __APPLE__
-        return _hs_darwin_get_hid_port_poll_handle(port);
+            return _hs_darwin_get_hid_port_poll_handle(port);
 #else
-        return _hs_get_file_port_poll_handle(port);
+            return _hs_get_file_port_poll_handle(port);
 #endif
-    case HS_DEVICE_TYPE_SERIAL:
-        return _hs_get_file_port_poll_handle(port);
+        } break;
+
+        case HS_DEVICE_TYPE_SERIAL: {
+            return _hs_get_file_port_poll_handle(port);
+        } break;
     }
 
     assert(false);
     return 0;
 }
 
-// filter.c
+// match.c
 // ------------------------------------
 
 // #include "common_priv.h"
 #ifndef _WIN32
     #include <sys/stat.h>
 #endif
-// #include "filter_priv.h"
+// #include "match_priv.h"
 
-int _hs_filter_init(_hs_filter *filter, const hs_match *matches, unsigned int count)
+int hs_match_parse(const char *str, hs_match_spec *rspec)
 {
-    if (!matches) {
-        filter->matches = NULL;
-        filter->count = 0;
-        filter->types = UINT32_MAX;
+    unsigned int vid = 0, pid = 0, type = 0;
+
+    str += strcspn(str, " ");
+    if (str[0]) {
+        char type_buf[16];
+        int r;
+
+        r = sscanf(str, "%04x:%04x/%15s", &vid, &pid, type_buf);
+        if (r < 2)
+            return hs_error(HS_ERROR_PARSE, "Malformed device match string '%s'", str);
+
+        if (r == 3) {
+            for (unsigned int i = 1; i < _HS_COUNTOF(hs_device_type_strings); i++) {
+                if (!strcmp(hs_device_type_strings[i], type_buf))
+                    type = i;
+            }
+            if (!type)
+                return hs_error(HS_ERROR_PARSE, "Unknown device type '%s' in match string '%s'",
+                                type_buf, str);
+        }
+    }
+
+    memset(rspec, 0, sizeof(*rspec));
+    rspec->vid = (uint16_t)vid;
+    rspec->pid = (uint16_t)pid;
+    rspec->type = type;
+    return 0;
+}
+
+int _hs_match_helper_init(_hs_match_helper *helper, const hs_match_spec *specs,
+                          unsigned int specs_count)
+{
+    if (!specs) {
+        helper->specs = NULL;
+        helper->specs_count = 0;
+        helper->types = UINT32_MAX;
 
         return 0;
     }
 
     // I promise to be careful
-    filter->matches = count ? (hs_match *)matches : NULL;
-    filter->count = count;
+    helper->specs = specs_count ? (hs_match_spec *)specs : NULL;
+    helper->specs_count = specs_count;
 
-    filter->types = 0;
-    for (unsigned int i = 0; i < count; i++) {
-        if (!matches[i].type) {
-            filter->types = UINT32_MAX;
+    helper->types = 0;
+    for (unsigned int i = 0; i < specs_count; i++) {
+        if (!specs[i].type) {
+            helper->types = UINT32_MAX;
             break;
         }
 
-        filter->types |= (uint32_t)(1 << matches[i].type);
+        helper->types |= (uint32_t)(1 << specs[i].type);
     }
 
     return 0;
 }
 
-void _hs_filter_release(_hs_filter *filter)
+void _hs_match_helper_release(_hs_match_helper *helper)
 {
-    _HS_UNUSED(filter);
+    _HS_UNUSED(helper);
 }
 
-static bool match_paths(const char *path1, const char *path2)
+static bool test_spec(const hs_match_spec *spec, const hs_device *dev)
 {
-#ifdef _WIN32
-    // This is mainly for COM ports, which exist as COMx files (with x < 10) and \\.\COMx files
-    if (strncmp(path1, "\\\\.\\", 4) == 0 || strncmp(path1, "\\\\?\\", 4) == 0)
-        path1 += 4;
-    if (strncmp(path2, "\\\\.\\", 4) == 0 || strncmp(path2, "\\\\?\\", 4) == 0)
-        path2 += 4;
-
-    // Device nodes are not valid Win32 filesystem paths so a simple comparison is enough
-    return strcasecmp(path1, path2) == 0;
-#else
-    struct stat sb1, sb2;
-    int r;
-
-    if (strcmp(path1, path2) == 0)
-        return true;
-
-    r = stat(path1, &sb1);
-    if (r < 0)
+    if (spec->type && dev->type != (hs_device_type)spec->type)
         return false;
-    r = stat(path2, &sb2);
-    if (r < 0)
+    if (spec->vid && dev->vid != spec->vid)
         return false;
-
-    return sb1.st_dev == sb2.st_dev && sb1.st_ino == sb2.st_ino;
-#endif
-}
-
-static bool test_match(const hs_match *match, const hs_device *dev)
-{
-    if (match->type && dev->type != (hs_device_type)match->type)
-        return false;
-    if (match->vid && dev->vid != match->vid)
-        return false;
-    if (match->pid && dev->pid != match->pid)
-        return false;
-    if (match->path && !match_paths(dev->path, match->path))
+    if (spec->pid && dev->pid != spec->pid)
         return false;
 
     return true;
 }
 
-bool _hs_filter_match_device(const _hs_filter *filter, const hs_device *dev)
+bool _hs_match_helper_match(const _hs_match_helper *helper, const hs_device *dev,
+                            void **rmatch_udata)
 {
     // Do the fast checks first
-    if (!_hs_filter_has_type(filter, dev->type))
+    if (!_hs_match_helper_has_type(helper, dev->type))
         return false;
-    if (!filter->count)
+    if (!helper->specs_count) {
+        if (rmatch_udata)
+            *rmatch_udata = NULL;
         return true;
+    }
 
-    for (unsigned int i = 0; i < filter->count; i++) {
-        if (test_match(&filter->matches[i], dev))
+    for (unsigned int i = 0; i < helper->specs_count; i++) {
+        if (test_spec(&helper->specs[i], dev)) {
+            if (rmatch_udata)
+                *rmatch_udata = helper->specs[i].udata;
             return true;
+        }
     }
 
     return false;
 }
 
-bool _hs_filter_has_type(const _hs_filter *filter, hs_device_type type)
+bool _hs_match_helper_has_type(const _hs_match_helper *helper, hs_device_type type)
 {
-    return filter->types & (uint32_t)(1 << type);
+    return helper->types & (uint32_t)(1 << type);
 }
 
 // htable.c
@@ -2225,7 +2269,7 @@ static int find_callback(hs_device *dev, void *udata)
     return 1;
 }
 
-int hs_find(const hs_match *matches, unsigned int count, hs_device **rdev)
+int hs_find(const hs_match_spec *matches, unsigned int count, hs_device **rdev)
 {
     assert(rdev);
     return hs_enumerate(matches, count, find_callback, rdev);
@@ -2359,15 +2403,9 @@ int _hs_open_file_port(hs_device *dev, hs_port_mode mode, hs_port **rport)
 
     access = UINT32_MAX;
     switch (mode) {
-    case HS_PORT_MODE_READ:
-        access = GENERIC_READ;
-        break;
-    case HS_PORT_MODE_WRITE:
-        access = GENERIC_WRITE;
-        break;
-    case HS_PORT_MODE_RW:
-        access = GENERIC_READ | GENERIC_WRITE;
-        break;
+        case HS_PORT_MODE_READ: { access = GENERIC_READ; } break;
+        case HS_PORT_MODE_WRITE: { access = GENERIC_WRITE; } break;
+        case HS_PORT_MODE_RW: { access = GENERIC_READ | GENERIC_WRITE; } break;
     }
     assert(access != UINT32_MAX);
 
@@ -2375,22 +2413,22 @@ int _hs_open_file_port(hs_device *dev, hs_port_mode mode, hs_port **rport)
                                   NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
     if (port->u.handle.h == INVALID_HANDLE_VALUE) {
         switch (GetLastError()) {
-        case ERROR_FILE_NOT_FOUND:
-        case ERROR_PATH_NOT_FOUND:
-            r = hs_error(HS_ERROR_NOT_FOUND, "Device '%s' not found", dev->path);
-            break;
-        case ERROR_NOT_ENOUGH_MEMORY:
-        case ERROR_OUTOFMEMORY:
-            r = hs_error(HS_ERROR_MEMORY, NULL);
-            break;
-        case ERROR_ACCESS_DENIED:
-            r = hs_error(HS_ERROR_ACCESS, "Permission denied for device '%s'", dev->path);
-            break;
+            case ERROR_FILE_NOT_FOUND:
+            case ERROR_PATH_NOT_FOUND: {
+                r = hs_error(HS_ERROR_NOT_FOUND, "Device '%s' not found", dev->path);
+            } break;
+            case ERROR_NOT_ENOUGH_MEMORY:
+            case ERROR_OUTOFMEMORY: {
+                r = hs_error(HS_ERROR_MEMORY, NULL);
+            } break;
+            case ERROR_ACCESS_DENIED: {
+                r = hs_error(HS_ERROR_ACCESS, "Permission denied for device '%s'", dev->path);
+            } break;
 
-        default:
-            r = hs_error(HS_ERROR_SYSTEM, "CreateFile('%s') failed: %s", dev->path,
-                         hs_win32_strerror(0));
-            break;
+            default: {
+                r = hs_error(HS_ERROR_SYSTEM, "CreateFile('%s') failed: %s", dev->path,
+                             hs_win32_strerror(0));
+            } break;
         }
         goto error;
     }
@@ -2806,7 +2844,7 @@ HS_END_C
 #include <wchar.h>
 // #include "array.h"
 // #include "device_priv.h"
-// #include "filter_priv.h"
+// #include "match_priv.h"
 // #include "monitor_priv.h"
 // #include "platform.h"
 
@@ -2823,7 +2861,7 @@ struct event {
 typedef _HS_ARRAY(struct event) event_array;
 
 struct hs_monitor {
-    _hs_filter filter;
+    _hs_match_helper match_helper;
     _hs_htable devices;
 
     HANDLE thread;
@@ -2896,29 +2934,29 @@ static bool get_device_cursor_relative(struct device_cursor *cursor,
     CONFIGRET cret = 0xFFFFFFFF;
 
     switch (relative) {
-    case DEVINST_RELATIVE_PARENT:
-        cret = CM_Get_Parent(&new_inst, cursor->inst, 0);
-        if (cret != CR_SUCCESS) {
-            hs_log(HS_LOG_DEBUG, "Cannot get parent of device '%s': 0x%lx", cursor->id, cret);
-            return false;
-        }
-        break;
+        case DEVINST_RELATIVE_PARENT: {
+            cret = CM_Get_Parent(&new_inst, cursor->inst, 0);
+            if (cret != CR_SUCCESS) {
+                hs_log(HS_LOG_DEBUG, "Cannot get parent of device '%s': 0x%lx", cursor->id, cret);
+                return false;
+            }
+        } break;
 
-    case DEVINST_RELATIVE_CHILD:
-        cret = CM_Get_Child(&new_inst, cursor->inst, 0);
-        if (cret != CR_SUCCESS) {
-            hs_log(HS_LOG_DEBUG, "Cannot get child of device '%s': 0x%lx", cursor->id, cret);
-            return false;
-        }
-        break;
+        case DEVINST_RELATIVE_CHILD: {
+            cret = CM_Get_Child(&new_inst, cursor->inst, 0);
+            if (cret != CR_SUCCESS) {
+                hs_log(HS_LOG_DEBUG, "Cannot get child of device '%s': 0x%lx", cursor->id, cret);
+                return false;
+            }
+        } break;
 
-    case DEVINST_RELATIVE_SIBLING:
-        cret = CM_Get_Sibling(&new_inst, cursor->inst, 0);
-        if (cret != CR_SUCCESS) {
-            hs_log(HS_LOG_DEBUG, "Cannot get sibling of device '%s': 0x%lx", cursor->id, cret);
-            return false;
-        }
-        break;
+        case DEVINST_RELATIVE_SIBLING: {
+            cret = CM_Get_Sibling(&new_inst, cursor->inst, 0);
+            if (cret != CR_SUCCESS) {
+                hs_log(HS_LOG_DEBUG, "Cannot get sibling of device '%s': 0x%lx", cursor->id, cret);
+                return false;
+            }
+        } break;
     }
     assert(cret != 0xFFFFFFFF);
 
@@ -3794,8 +3832,8 @@ cleanup:
     return r;
 }
 
-static int enumerate_setup_class(const GUID *guid, const _hs_filter *filter, hs_enumerate_func *f,
-                                 void *udata)
+static int enumerate_setup_class(const GUID *guid, const _hs_match_helper *match_helper,
+                                 hs_enumerate_func *f, void *udata)
 {
     HDEVINFO set = NULL;
     SP_DEVINFO_DATA info;
@@ -3816,7 +3854,7 @@ static int enumerate_setup_class(const GUID *guid, const _hs_filter *filter, hs_
         if (!r)
             continue;
 
-        if (_hs_filter_match_device(filter, dev)) {
+        if (_hs_match_helper_match(match_helper, dev, &dev->match_udata)) {
             r = (*f)(dev, udata);
             hs_device_unref(dev);
             if (r)
@@ -3833,7 +3871,7 @@ cleanup:
     return r;
 }
 
-int enumerate(_hs_filter *filter, hs_enumerate_func *f, void *udata)
+int enumerate(_hs_match_helper *match_helper, hs_enumerate_func *f, void *udata)
 {
     int r;
 
@@ -3842,7 +3880,7 @@ int enumerate(_hs_filter *filter, hs_enumerate_func *f, void *udata)
         return r;
 
     for (unsigned int i = 0; i < _HS_COUNTOF(setup_classes); i++) {
-        if (_hs_filter_has_type(filter, setup_classes[i].type)) {
+        if (_hs_match_helper_has_type(match_helper, setup_classes[i].type)) {
             GUID guids[8];
             DWORD guids_count;
             BOOL success;
@@ -3854,7 +3892,7 @@ int enumerate(_hs_filter *filter, hs_enumerate_func *f, void *udata)
                                 setup_classes[i].name, hs_win32_strerror(0));
 
             for (unsigned int j = 0; j < guids_count; j++) {
-                r = enumerate_setup_class(&guids[j], filter, f, udata);
+                r = enumerate_setup_class(&guids[j], match_helper, f, udata);
                 if (r)
                     return r;
             }
@@ -3877,24 +3915,24 @@ static int enumerate_enumerate_callback(hs_device *dev, void *udata)
     return (*ctx->f)(dev, ctx->udata);
 }
 
-int hs_enumerate(const hs_match *matches, unsigned int count, hs_enumerate_func *f, void *udata)
+int hs_enumerate(const hs_match_spec *matches, unsigned int count, hs_enumerate_func *f, void *udata)
 {
     assert(f);
 
-    _hs_filter filter = {0};
+    _hs_match_helper match_helper = {0};
     struct enumerate_enumerate_context ctx;
     int r;
 
-    r = _hs_filter_init(&filter, matches, count);
+    r = _hs_match_helper_init(&match_helper, matches, count);
     if (r < 0)
         return r;
 
     ctx.f = f;
     ctx.udata = udata;
 
-    r = enumerate(&filter, enumerate_enumerate_callback, &ctx);
+    r = enumerate(&match_helper, enumerate_enumerate_callback, &ctx);
 
-    _hs_filter_release(&filter);
+    _hs_match_helper_release(&match_helper);
     return r;
 }
 
@@ -3961,49 +3999,50 @@ static LRESULT __stdcall window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM 
     int r;
 
     switch (msg) {
-    case WM_DEVICECHANGE:
-        r = 0;
-        switch (wparam) {
-        case DBT_DEVICEARRIVAL:
-            r = post_event(monitor, DEVICE_EVENT_ADDED,
-                                  (DEV_BROADCAST_DEVICEINTERFACE *)lparam);
-            break;
-        case DBT_DEVICEREMOVECOMPLETE:
-            r = post_event(monitor, DEVICE_EVENT_REMOVED,
-                                  (DEV_BROADCAST_DEVICEINTERFACE *)lparam);
-            break;
-        }
-        if (r < 0) {
-            EnterCriticalSection(&monitor->events_lock);
-            monitor->thread_ret = r;
-            SetEvent(monitor->thread_event);
-            LeaveCriticalSection(&monitor->events_lock);
-        }
-        break;
+        case WM_DEVICECHANGE: {
+            r = 0;
+            switch (wparam) {
+                case DBT_DEVICEARRIVAL: {
+                    r = post_event(monitor, DEVICE_EVENT_ADDED,
+                                          (DEV_BROADCAST_DEVICEINTERFACE *)lparam);
+                } break;
 
-    case WM_TIMER:
-        if (CMP_WaitNoPendingInstallEvents(0) == WAIT_OBJECT_0) {
-            KillTimer(hwnd, 1);
-
-            EnterCriticalSection(&monitor->events_lock);
-            r = _hs_array_grow(&monitor->events, monitor->thread_events.count);
-            if (r < 0) {
-                monitor->thread_ret = r;
-            } else {
-                memcpy(monitor->events.values + monitor->events.count,
-                       monitor->thread_events.values,
-                       monitor->thread_events.count * sizeof(*monitor->thread_events.values));
-                monitor->events.count += monitor->thread_events.count;
-                _hs_array_release(&monitor->thread_events);
+                case DBT_DEVICEREMOVECOMPLETE: {
+                    r = post_event(monitor, DEVICE_EVENT_REMOVED,
+                                          (DEV_BROADCAST_DEVICEINTERFACE *)lparam);
+                } break;
             }
-            SetEvent(monitor->thread_event);
-            LeaveCriticalSection(&monitor->events_lock);
-        }
-        break;
+            if (r < 0) {
+                EnterCriticalSection(&monitor->events_lock);
+                monitor->thread_ret = r;
+                SetEvent(monitor->thread_event);
+                LeaveCriticalSection(&monitor->events_lock);
+            }
+        } break;
 
-    case WM_CLOSE:
-        PostQuitMessage(0);
-        break;
+        case WM_TIMER: {
+            if (CMP_WaitNoPendingInstallEvents(0) == WAIT_OBJECT_0) {
+                KillTimer(hwnd, 1);
+
+                EnterCriticalSection(&monitor->events_lock);
+                r = _hs_array_grow(&monitor->events, monitor->thread_events.count);
+                if (r < 0) {
+                    monitor->thread_ret = r;
+                } else {
+                    memcpy(monitor->events.values + monitor->events.count,
+                           monitor->thread_events.values,
+                           monitor->thread_events.count * sizeof(*monitor->thread_events.values));
+                    monitor->events.count += monitor->thread_events.count;
+                    _hs_array_release(&monitor->thread_events);
+                }
+                SetEvent(monitor->thread_event);
+                LeaveCriticalSection(&monitor->events_lock);
+            }
+        } break;
+
+        case WM_CLOSE: {
+            PostQuitMessage(0);
+        } break;
     }
 
     return DefWindowProc(hwnd, msg, wparam, lparam);
@@ -4092,9 +4131,6 @@ cleanup:
 static int monitor_enumerate_callback(hs_device *dev, void *udata)
 {
     hs_monitor *monitor = (hs_monitor *)udata;
-
-    if (!_hs_filter_match_device(&monitor->filter, dev))
-        return 0;
     return _hs_monitor_add(&monitor->devices, dev, NULL, NULL);
 }
 
@@ -4102,7 +4138,7 @@ static int monitor_enumerate_callback(hs_device *dev, void *udata)
    thread message queue. Unfortunately we can't poll on message queues so instead, we make a
    background thread to get device notifications, and tell us about it using Win32 events which
    we can poll. */
-int hs_monitor_new(const hs_match *matches, unsigned int count, hs_monitor **rmonitor)
+int hs_monitor_new(const hs_match_spec *matches, unsigned int count, hs_monitor **rmonitor)
 {
     assert(rmonitor);
 
@@ -4115,7 +4151,7 @@ int hs_monitor_new(const hs_match *matches, unsigned int count, hs_monitor **rmo
         goto error;
     }
 
-    r = _hs_filter_init(&monitor->filter, matches, count);
+    r = _hs_match_helper_init(&monitor->match_helper, matches, count);
     if (r < 0)
         goto error;
 
@@ -4149,7 +4185,7 @@ void hs_monitor_free(hs_monitor *monitor)
 
         _hs_monitor_clear_devices(&monitor->devices);
         _hs_htable_release(&monitor->devices);
-        _hs_filter_release(&monitor->filter);
+        _hs_match_helper_release(&monitor->match_helper);
     }
 
     free(monitor);
@@ -4187,7 +4223,7 @@ int hs_monitor_start(hs_monitor *monitor)
     }
     ResetEvent(monitor->thread_event);
 
-    r = enumerate(&monitor->filter, monitor_enumerate_callback, monitor);
+    r = enumerate(&monitor->match_helper, monitor_enumerate_callback, monitor);
     if (r < 0)
         goto error;
 
@@ -4237,7 +4273,7 @@ static int process_arrival_event(hs_monitor *monitor, const char *key, hs_enumer
     if (r <= 0)
         return r;
 
-    r = _hs_filter_match_device(&monitor->filter, dev);
+    r = _hs_match_helper_match(&monitor->match_helper, dev, &dev->match_udata);
     if (r)
         r = _hs_monitor_add(&monitor->devices, dev, f, udata);
     hs_device_unref(dev);
@@ -4273,19 +4309,19 @@ int hs_monitor_refresh(hs_monitor *monitor, hs_enumerate_func *f, void *udata)
         struct event *event = &monitor->refresh_events.values[event_idx];
 
         switch (event->type) {
-        case DEVICE_EVENT_ADDED:
-            hs_log(HS_LOG_DEBUG, "Received arrival notification for device '%s'",
-                   event->device_key);
-            r = process_arrival_event(monitor, event->device_key, f, udata);
-            if (r)
-                goto cleanup;
-            break;
+            case DEVICE_EVENT_ADDED: {
+                hs_log(HS_LOG_DEBUG, "Received arrival notification for device '%s'",
+                       event->device_key);
+                r = process_arrival_event(monitor, event->device_key, f, udata);
+                if (r)
+                    goto cleanup;
+            } break;
 
-        case DEVICE_EVENT_REMOVED:
-            hs_log(HS_LOG_DEBUG, "Received removal notification for device '%s'",
-                   event->device_key);
-            _hs_monitor_remove(&monitor->devices, event->device_key, f, udata);
-            break;
+            case DEVICE_EVENT_REMOVED: {
+                hs_log(HS_LOG_DEBUG, "Received removal notification for device '%s'",
+                       event->device_key);
+                _hs_monitor_remove(&monitor->devices, event->device_key, f, udata);
+            } break;
         }
     }
 
@@ -4293,7 +4329,7 @@ int hs_monitor_refresh(hs_monitor *monitor, hs_enumerate_func *f, void *udata)
 cleanup:
     /* If an error occurs, there may be unprocessed notifications. Keep them in
        monitor->refresh_events for the next time this function is called. */
-    _hs_array_deque(&monitor->refresh_events, event_idx);
+    _hs_array_remove(&monitor->refresh_events, 0, event_idx);
     EnterCriticalSection(&monitor->events_lock);
     if (!monitor->refresh_events.count && !monitor->events.count)
         ResetEvent(monitor->thread_event);
@@ -4452,138 +4488,148 @@ int hs_serial_set_config(hs_port *port, const hs_serial_config *config)
                         hs_win32_strerror(0));
 
     switch (config->baudrate) {
-    case 0:
-        break;
-    case 110:
-    case 134:
-    case 150:
-    case 200:
-    case 300:
-    case 600:
-    case 1200:
-    case 1800:
-    case 2400:
-    case 4800:
-    case 9600:
-    case 19200:
-    case 38400:
-    case 57600:
-    case 115200:
-    case 230400:
-        dcb.BaudRate = config->baudrate;
-        break;
-    default:
-        return hs_error(HS_ERROR_SYSTEM, "Unsupported baud rate value: %u", config->baudrate);
+        case 0: {} break;
+
+        case 110:
+        case 134:
+        case 150:
+        case 200:
+        case 300:
+        case 600:
+        case 1200:
+        case 1800:
+        case 2400:
+        case 4800:
+        case 9600:
+        case 19200:
+        case 38400:
+        case 57600:
+        case 115200:
+        case 230400: {
+            dcb.BaudRate = config->baudrate;
+        } break;
+
+        default: {
+            return hs_error(HS_ERROR_SYSTEM, "Unsupported baud rate value: %u", config->baudrate);
+        } break;
     }
 
     switch (config->databits) {
-    case 0:
-        break;
-    case 5:
-    case 6:
-    case 7:
-    case 8:
-        dcb.ByteSize = (BYTE)config->databits;
-        break;
-    default:
-        return hs_error(HS_ERROR_SYSTEM, "Invalid data bits setting: %u", config->databits);
+        case 0: {} break;
+
+        case 5:
+        case 6:
+        case 7:
+        case 8: {
+            dcb.ByteSize = (BYTE)config->databits;
+        } break;
+
+        default: {
+            return hs_error(HS_ERROR_SYSTEM, "Invalid data bits setting: %u", config->databits);
+        } break;
     }
 
     switch (config->stopbits) {
-    case 0:
-        break;
-    case 1:
-        dcb.StopBits = ONESTOPBIT;
-        break;
-    case 2:
-        dcb.StopBits = TWOSTOPBITS;
-        break;
-    default:
-        return hs_error(HS_ERROR_SYSTEM, "Invalid stop bits setting: %u", config->stopbits);
+        case 0: {} break;
+
+        case 1: { dcb.StopBits = ONESTOPBIT; } break;
+        case 2: { dcb.StopBits = TWOSTOPBITS; } break;
+
+        default: {
+            return hs_error(HS_ERROR_SYSTEM, "Invalid stop bits setting: %u", config->stopbits);
+        } break;
     }
 
     switch (config->parity) {
-    case 0:
-        break;
-    case HS_SERIAL_CONFIG_PARITY_OFF:
-        dcb.fParity = FALSE;
-        dcb.Parity = NOPARITY;
-        break;
-    case HS_SERIAL_CONFIG_PARITY_EVEN:
-        dcb.fParity = TRUE;
-        dcb.Parity = EVENPARITY;
-        break;
-    case HS_SERIAL_CONFIG_PARITY_ODD:
-        dcb.fParity = TRUE;
-        dcb.Parity = ODDPARITY;
-        break;
-    case HS_SERIAL_CONFIG_PARITY_MARK:
-        dcb.fParity = TRUE;
-        dcb.Parity = MARKPARITY;
-        break;
-    case HS_SERIAL_CONFIG_PARITY_SPACE:
-        dcb.fParity = TRUE;
-        dcb.Parity = SPACEPARITY;
-        break;
-    default:
-        return hs_error(HS_ERROR_SYSTEM, "Invalid parity setting: %d", config->parity);
+        case 0: {} break;
+
+        case HS_SERIAL_CONFIG_PARITY_OFF: {
+            dcb.fParity = FALSE;
+            dcb.Parity = NOPARITY;
+        } break;
+        case HS_SERIAL_CONFIG_PARITY_EVEN: {
+            dcb.fParity = TRUE;
+            dcb.Parity = EVENPARITY;
+        } break;
+        case HS_SERIAL_CONFIG_PARITY_ODD: {
+            dcb.fParity = TRUE;
+            dcb.Parity = ODDPARITY;
+        } break;
+        case HS_SERIAL_CONFIG_PARITY_MARK: {
+            dcb.fParity = TRUE;
+            dcb.Parity = MARKPARITY;
+        } break;
+        case HS_SERIAL_CONFIG_PARITY_SPACE: {
+            dcb.fParity = TRUE;
+            dcb.Parity = SPACEPARITY;
+        } break;
+
+        default: {
+            return hs_error(HS_ERROR_SYSTEM, "Invalid parity setting: %d", config->parity);
+        } break;
     }
 
     switch (config->rts) {
-    case 0:
-        break;
-    case HS_SERIAL_CONFIG_RTS_OFF:
-        dcb.fRtsControl = RTS_CONTROL_DISABLE;
-        dcb.fOutxCtsFlow = FALSE;
-        break;
-    case HS_SERIAL_CONFIG_RTS_ON:
-        dcb.fRtsControl = RTS_CONTROL_ENABLE;
-        dcb.fOutxCtsFlow = FALSE;
-        break;
-    case HS_SERIAL_CONFIG_RTS_FLOW:
-        dcb.fRtsControl = RTS_CONTROL_HANDSHAKE;
-        dcb.fOutxCtsFlow = TRUE;
-        break;
-    default:
-        return hs_error(HS_ERROR_SYSTEM, "Invalid RTS setting: %d", config->rts);
+        case 0: {} break;
+
+        case HS_SERIAL_CONFIG_RTS_OFF: {
+            dcb.fRtsControl = RTS_CONTROL_DISABLE;
+            dcb.fOutxCtsFlow = FALSE;
+        } break;
+        case HS_SERIAL_CONFIG_RTS_ON: {
+            dcb.fRtsControl = RTS_CONTROL_ENABLE;
+            dcb.fOutxCtsFlow = FALSE;
+        } break;
+        case HS_SERIAL_CONFIG_RTS_FLOW: {
+            dcb.fRtsControl = RTS_CONTROL_HANDSHAKE;
+            dcb.fOutxCtsFlow = TRUE;
+        } break;
+
+        default: {
+            return hs_error(HS_ERROR_SYSTEM, "Invalid RTS setting: %d", config->rts);
+        } break;
     }
 
     switch (config->dtr) {
-    case 0:
-        break;
-    case HS_SERIAL_CONFIG_DTR_OFF:
-        dcb.fDtrControl = DTR_CONTROL_DISABLE;
-        dcb.fOutxDsrFlow = FALSE;
-        break;
-    case HS_SERIAL_CONFIG_DTR_ON:
-        dcb.fDtrControl = DTR_CONTROL_ENABLE;
-        dcb.fOutxDsrFlow = FALSE;
-        break;
-    default:
-        return hs_error(HS_ERROR_SYSTEM, "Invalid DTR setting: %d", config->dtr);
+        case 0: {} break;
+
+        case HS_SERIAL_CONFIG_DTR_OFF: {
+            dcb.fDtrControl = DTR_CONTROL_DISABLE;
+            dcb.fOutxDsrFlow = FALSE;
+        } break;
+        case HS_SERIAL_CONFIG_DTR_ON: {
+            dcb.fDtrControl = DTR_CONTROL_ENABLE;
+            dcb.fOutxDsrFlow = FALSE;
+        } break;
+
+        default: {
+            return hs_error(HS_ERROR_SYSTEM, "Invalid DTR setting: %d", config->dtr);
+        } break;
     }
 
     switch (config->xonxoff) {
-    case 0:
-        break;
-    case HS_SERIAL_CONFIG_XONXOFF_OFF:
-        dcb.fOutX = FALSE;
-        dcb.fInX = FALSE;
-        break;
-    case HS_SERIAL_CONFIG_XONXOFF_IN:
-        dcb.fOutX = FALSE;
-        dcb.fInX = TRUE;
-        break;
-    case HS_SERIAL_CONFIG_XONXOFF_OUT:
-        dcb.fOutX = TRUE;
-        dcb.fInX = FALSE;
-        break;
-    case HS_SERIAL_CONFIG_XONXOFF_INOUT:
-        dcb.fOutX = TRUE;
-        dcb.fInX = TRUE;
-        break;
-    default:
-        return hs_error(HS_ERROR_SYSTEM, "Invalid XON/XOFF setting: %d", config->xonxoff);
+        case 0: {} break;
+
+        case HS_SERIAL_CONFIG_XONXOFF_OFF: {
+            dcb.fOutX = FALSE;
+            dcb.fInX = FALSE;
+        } break;
+        case HS_SERIAL_CONFIG_XONXOFF_IN: {
+            dcb.fOutX = FALSE;
+            dcb.fInX = TRUE;
+        } break;
+        case HS_SERIAL_CONFIG_XONXOFF_OUT: {
+            dcb.fOutX = TRUE;
+            dcb.fInX = FALSE;
+        } break;
+        case HS_SERIAL_CONFIG_XONXOFF_INOUT: {
+            dcb.fOutX = TRUE;
+            dcb.fInX = TRUE;
+        } break;
+
+        default: {
+            return hs_error(HS_ERROR_SYSTEM, "Invalid XON/XOFF setting: %d", config->xonxoff);
+        } break;
     }
 
     success = SetCommState(port->u.handle.h, &dcb);
@@ -4617,55 +4663,31 @@ int hs_serial_get_config(hs_port *port, hs_serial_config *config)
 
     // There is also ONE5STOPBITS, ignore it for now (and ever, probably)
     switch (dcb.StopBits) {
-    case ONESTOPBIT:
-        config->stopbits = 1;
-        break;
-    case TWOSTOPBITS:
-        config->stopbits = 2;
-        break;
+        case ONESTOPBIT: { config->stopbits = 1; } break;
+        case TWOSTOPBITS: { config->stopbits = 2; } break;
     }
 
     if (dcb.fParity) {
         switch (dcb.Parity) {
-        case NOPARITY:
-            config->parity = HS_SERIAL_CONFIG_PARITY_OFF;
-            break;
-        case EVENPARITY:
-            config->parity = HS_SERIAL_CONFIG_PARITY_EVEN;
-            break;
-        case ODDPARITY:
-            config->parity = HS_SERIAL_CONFIG_PARITY_ODD;
-            break;
-        case MARKPARITY:
-            config->parity = HS_SERIAL_CONFIG_PARITY_MARK;
-            break;
-        case SPACEPARITY:
-            config->parity = HS_SERIAL_CONFIG_PARITY_SPACE;
-            break;
+            case NOPARITY: { config->parity = HS_SERIAL_CONFIG_PARITY_OFF; } break;
+            case EVENPARITY: { config->parity = HS_SERIAL_CONFIG_PARITY_EVEN; } break;
+            case ODDPARITY: { config->parity = HS_SERIAL_CONFIG_PARITY_ODD; } break;
+            case MARKPARITY: { config->parity = HS_SERIAL_CONFIG_PARITY_MARK; } break;
+            case SPACEPARITY: { config->parity = HS_SERIAL_CONFIG_PARITY_SPACE; } break;
         }
     } else {
         config->parity = HS_SERIAL_CONFIG_PARITY_OFF;
     }
 
     switch (dcb.fRtsControl) {
-    case RTS_CONTROL_DISABLE:
-        config->rts = HS_SERIAL_CONFIG_RTS_OFF;
-        break;
-    case RTS_CONTROL_ENABLE:
-        config->rts = HS_SERIAL_CONFIG_RTS_ON;
-        break;
-    case RTS_CONTROL_HANDSHAKE:
-        config->rts = HS_SERIAL_CONFIG_RTS_FLOW;
-        break;
+        case RTS_CONTROL_DISABLE: { config->rts = HS_SERIAL_CONFIG_RTS_OFF; } break;
+        case RTS_CONTROL_ENABLE: { config->rts = HS_SERIAL_CONFIG_RTS_ON; } break;
+        case RTS_CONTROL_HANDSHAKE: { config->rts = HS_SERIAL_CONFIG_RTS_FLOW; } break;
     }
 
     switch (dcb.fDtrControl) {
-    case DTR_CONTROL_DISABLE:
-        config->dtr = HS_SERIAL_CONFIG_DTR_OFF;
-        break;
-    case DTR_CONTROL_ENABLE:
-        config->dtr = HS_SERIAL_CONFIG_DTR_ON;
-        break;
+        case DTR_CONTROL_DISABLE: { config->dtr = HS_SERIAL_CONFIG_DTR_OFF; } break;
+        case DTR_CONTROL_ENABLE: { config->dtr = HS_SERIAL_CONFIG_DTR_ON; } break;
     }
 
     if (dcb.fInX && dcb.fOutX) {
@@ -4773,48 +4795,46 @@ int _hs_open_file_port(hs_device *dev, hs_port_mode mode, hs_port **rport)
 
     fd_flags = O_CLOEXEC | O_NOCTTY | O_NONBLOCK;
     switch (mode) {
-    case HS_PORT_MODE_READ:
-        fd_flags |= O_RDONLY;
-        break;
-    case HS_PORT_MODE_WRITE:
-        fd_flags |= O_WRONLY;
-        break;
-    case HS_PORT_MODE_RW:
-        fd_flags |= O_RDWR;
-        break;
+        case HS_PORT_MODE_READ: { fd_flags |= O_RDONLY; } break;
+        case HS_PORT_MODE_WRITE: { fd_flags |= O_WRONLY; } break;
+        case HS_PORT_MODE_RW: { fd_flags |= O_RDWR; } break;
     }
 
 restart:
     port->u.file.fd = open(dev->path, fd_flags);
     if (port->u.file.fd < 0) {
         switch (errno) {
-        case EINTR:
-            goto restart;
-        case EACCES:
-            r = hs_error(HS_ERROR_ACCESS, "Permission denied for device '%s'", dev->path);
-            break;
-        case EIO:
-        case ENXIO:
-        case ENODEV:
-            r = hs_error(HS_ERROR_IO, "I/O error while opening device '%s'", dev->path);
-            break;
-        case ENOENT:
-        case ENOTDIR:
-            r = hs_error(HS_ERROR_NOT_FOUND, "Device '%s' not found", dev->path);
-            break;
+            case EINTR: {
+                goto restart;
+            } break;
+
+            case EACCES: {
+                r = hs_error(HS_ERROR_ACCESS, "Permission denied for device '%s'", dev->path);
+            } break;
+            case EIO:
+            case ENXIO:
+            case ENODEV: {
+                r = hs_error(HS_ERROR_IO, "I/O error while opening device '%s'", dev->path);
+            } break;
+            case ENOENT:
+            case ENOTDIR: {
+                r = hs_error(HS_ERROR_NOT_FOUND, "Device '%s' not found", dev->path);
+            } break;
 
 #ifdef __APPLE__
-        /* On El Capitan (and maybe before), the open fails for some time (around 40 - 50 ms on my
-           computer) after the device notification. */
-        case EBUSY:
-            if (retry--) {
-                usleep(20000);
-                goto restart;
-            }
+            /* On El Capitan (and maybe before), the open fails for some time (around 40 - 50 ms
+               on my computer) after the device notification. */
+            case EBUSY: {
+                if (retry--) {
+                    usleep(20000);
+                    goto restart;
+                }
+            } // fallthrough
 #endif
-        default:
-            r = hs_error(HS_ERROR_SYSTEM, "open('%s') failed: %s", dev->path, strerror(errno));
-            break;
+
+            default: {
+                r = hs_error(HS_ERROR_SYSTEM, "open('%s') failed: %s", dev->path, strerror(errno));
+            } break;
         }
         goto error;
     }
@@ -5295,7 +5315,7 @@ restart:
     r = (ssize_t)size;
 
     // Circular buffer would be more appropriate. Later.
-    _hs_array_deque(&hid->reports, 1);
+    _hs_array_remove(&hid->reports, 0, 1);
 
 cleanup:
     if (!hid->reports.count)
@@ -5394,12 +5414,12 @@ ssize_t hs_hid_send_feature_report(hs_port *port, const uint8_t *buf, size_t siz
 #include <sys/time.h>
 #include <unistd.h>
 // #include "device_priv.h"
-// #include "filter_priv.h"
+// #include "match_priv.h"
 // #include "monitor_priv.h"
 // #include "platform.h"
 
 struct hs_monitor {
-    _hs_filter filter;
+    _hs_match_helper match_helper;
     _hs_htable devices;
 
     IONotificationPortRef notify_port;
@@ -5733,7 +5753,7 @@ cleanup:
     return r;
 }
 
-static int process_iterator_devices(io_iterator_t it, const _hs_filter *filter,
+static int process_iterator_devices(io_iterator_t it, const _hs_match_helper *match_helper,
                                     hs_enumerate_func *f, void *udata)
 {
     io_service_t service;
@@ -5749,7 +5769,7 @@ static int process_iterator_devices(io_iterator_t it, const _hs_filter *filter,
         if (!r)
             continue;
 
-        if (_hs_filter_match_device(filter, dev)) {
+        if (_hs_match_helper_match(match_helper, dev, &dev->match_udata)) {
             r = (*f)(dev, udata);
             hs_device_unref(dev);
             if (r)
@@ -5766,7 +5786,7 @@ static int attached_callback(hs_device *dev, void *udata)
 {
     hs_monitor *monitor = (hs_monitor *)udata;
 
-    if (!_hs_filter_match_device(&monitor->filter, dev))
+    if (!_hs_match_helper_match(&monitor->match_helper, dev, &dev->match_udata))
         return 0;
     return _hs_monitor_add(&monitor->devices, dev, monitor->callback, monitor->callback_udata);
 }
@@ -5775,7 +5795,7 @@ static void darwin_devices_attached(void *udata, io_iterator_t it)
 {
     hs_monitor *monitor = (hs_monitor *)udata;
 
-    monitor->notify_ret = process_iterator_devices(it, &monitor->filter,
+    monitor->notify_ret = process_iterator_devices(it, &monitor->match_helper,
                                                    attached_callback, monitor);
 }
 
@@ -5813,17 +5833,17 @@ static int enumerate_enumerate_callback(hs_device *dev, void *udata)
     return (*ctx->f)(dev, ctx->udata);
 }
 
-int hs_enumerate(const hs_match *matches, unsigned int count, hs_enumerate_func *f, void *udata)
+int hs_enumerate(const hs_match_spec *matches, unsigned int count, hs_enumerate_func *f, void *udata)
 {
     assert(f);
 
-    _hs_filter filter;
+    _hs_match_helper match_helper;
     struct enumerate_enumerate_context ctx;
     io_iterator_t it = 0;
     kern_return_t kret;
     int r;
 
-    r = _hs_filter_init(&filter, matches, count);
+    r = _hs_match_helper_init(&match_helper, matches, count);
     if (r < 0)
         goto cleanup;
 
@@ -5831,7 +5851,7 @@ int hs_enumerate(const hs_match *matches, unsigned int count, hs_enumerate_func 
     ctx.udata = udata;
 
     for (unsigned int i = 0; device_classes[i].old_stack; i++) {
-        if (_hs_filter_has_type(&filter, device_classes[i].type)) {
+        if (_hs_match_helper_has_type(&match_helper, device_classes[i].type)) {
             const char *cls = correct_class(device_classes[i].new_stack, device_classes[i].old_stack);
 
             kret = IOServiceGetMatchingServices(kIOMasterPortDefault, IOServiceMatching(cls), &it);
@@ -5840,7 +5860,7 @@ int hs_enumerate(const hs_match *matches, unsigned int count, hs_enumerate_func 
                 goto cleanup;
             }
 
-            r = process_iterator_devices(it, &filter, enumerate_enumerate_callback, &ctx);
+            r = process_iterator_devices(it, &match_helper, enumerate_enumerate_callback, &ctx);
             if (r)
                 goto cleanup;
 
@@ -5855,7 +5875,7 @@ cleanup:
         clear_iterator(it);
         IOObjectRelease(it);
     }
-    _hs_filter_release(&filter);
+    _hs_match_helper_release(&match_helper);
     return r;
 }
 
@@ -5877,7 +5897,7 @@ static int add_notification(hs_monitor *monitor, const char *cls, const io_name_
     return 0;
 }
 
-int hs_monitor_new(const hs_match *matches, unsigned int count, hs_monitor **rmonitor)
+int hs_monitor_new(const hs_match_spec *matches, unsigned int count, hs_monitor **rmonitor)
 {
     assert(rmonitor);
 
@@ -5895,7 +5915,7 @@ int hs_monitor_new(const hs_match *matches, unsigned int count, hs_monitor **rmo
 
     monitor->kqfd = -1;
 
-    r = _hs_filter_init(&monitor->filter, matches, count);
+    r = _hs_match_helper_init(&monitor->match_helper, matches, count);
     if (r < 0)
         goto error;
 
@@ -5960,7 +5980,7 @@ void hs_monitor_free(hs_monitor *monitor)
 
         _hs_monitor_clear_devices(&monitor->devices);
         _hs_htable_release(&monitor->devices);
-        _hs_filter_release(&monitor->filter);
+        _hs_match_helper_release(&monitor->match_helper);
     }
 
     free(monitor);
@@ -5975,9 +5995,6 @@ hs_handle hs_monitor_get_poll_handle(const hs_monitor *monitor)
 static int start_enumerate_callback(hs_device *dev, void *udata)
 {
     hs_monitor *monitor = (hs_monitor *)udata;
-
-    if (!_hs_filter_match_device(&monitor->filter, dev))
-        return 0;
     return _hs_monitor_add(&monitor->devices, dev, NULL, NULL);
 }
 
@@ -5992,13 +6009,13 @@ int hs_monitor_start(hs_monitor *monitor)
         return 0;
 
     for (unsigned int i = 0; device_classes[i].old_stack; i++) {
-        if (_hs_filter_has_type(&monitor->filter, device_classes[i].type)) {
+        if (_hs_match_helper_has_type(&monitor->match_helper, device_classes[i].type)) {
             r = add_notification(monitor, correct_class(device_classes[i].new_stack, device_classes[i].old_stack),
                                  kIOFirstMatchNotification, darwin_devices_attached, &it);
             if (r < 0)
                 goto error;
 
-            r = process_iterator_devices(it, &monitor->filter, start_enumerate_callback, monitor);
+            r = process_iterator_devices(it, &monitor->match_helper, start_enumerate_callback, monitor);
             if (r < 0)
                 goto error;
         }
@@ -6217,56 +6234,27 @@ int hs_serial_set_config(hs_port *port, const hs_serial_config *config)
         speed_t std_baudrate;
 
         switch (config->baudrate) {
-        case 110:
-            std_baudrate = B110;
-            break;
-        case 134:
-            std_baudrate = B134;
-            break;
-        case 150:
-            std_baudrate = B150;
-            break;
-        case 200:
-            std_baudrate = B200;
-            break;
-        case 300:
-            std_baudrate = B300;
-            break;
-        case 600:
-            std_baudrate = B600;
-            break;
-        case 1200:
-            std_baudrate = B1200;
-            break;
-        case 1800:
-            std_baudrate = B1800;
-            break;
-        case 2400:
-            std_baudrate = B2400;
-            break;
-        case 4800:
-            std_baudrate = B4800;
-            break;
-        case 9600:
-            std_baudrate = B9600;
-            break;
-        case 19200:
-            std_baudrate = B19200;
-            break;
-        case 38400:
-            std_baudrate = B38400;
-            break;
-        case 57600:
-            std_baudrate = B57600;
-            break;
-        case 115200:
-            std_baudrate = B115200;
-            break;
-        case 230400:
-            std_baudrate = B230400;
-            break;
-        default:
-            return hs_error(HS_ERROR_SYSTEM, "Unsupported baud rate value: %u", config->baudrate);
+            case 110: { std_baudrate = B110; } break;
+            case 134: { std_baudrate = B134; } break;
+            case 150: { std_baudrate = B150; } break;
+            case 200: { std_baudrate = B200; } break;
+            case 300: { std_baudrate = B300; } break;
+            case 600: { std_baudrate = B600; } break;
+            case 1200: { std_baudrate = B1200; } break;
+            case 1800: { std_baudrate = B1800; } break;
+            case 2400: { std_baudrate = B2400; } break;
+            case 4800: { std_baudrate = B4800; } break;
+            case 9600: { std_baudrate = B9600; } break;
+            case 19200: { std_baudrate = B19200; } break;
+            case 38400: { std_baudrate = B38400; } break;
+            case 57600: { std_baudrate = B57600; } break;
+            case 115200: { std_baudrate = B115200; } break;
+            case 230400: { std_baudrate = B230400; } break;
+
+            default: {
+                return hs_error(HS_ERROR_SYSTEM, "Unsupported baud rate value: %u",
+                                config->baudrate);
+            } break;
         }
 
         cfsetispeed(&tio, std_baudrate);
@@ -6277,20 +6265,15 @@ int hs_serial_set_config(hs_port *port, const hs_serial_config *config)
         tio.c_cflag &= (unsigned int)~CSIZE;
 
         switch (config->databits) {
-        case 5:
-            tio.c_cflag |= CS5;
-            break;
-        case 6:
-            tio.c_cflag |= CS6;
-            break;
-        case 7:
-            tio.c_cflag |= CS7;
-            break;
-        case 8:
-            tio.c_cflag |= CS8;
-            break;
-        default:
-            return hs_error(HS_ERROR_SYSTEM, "Invalid data bits setting: %u", config->databits);
+            case 5: { tio.c_cflag |= CS5; } break;
+            case 6: { tio.c_cflag |= CS6; } break;
+            case 7: { tio.c_cflag |= CS7; } break;
+            case 8: { tio.c_cflag |= CS8; } break;
+
+            default: {
+                return hs_error(HS_ERROR_SYSTEM, "Invalid data bits setting: %u",
+                                config->databits);
+            } break;
         }
     }
 
@@ -6298,13 +6281,13 @@ int hs_serial_set_config(hs_port *port, const hs_serial_config *config)
         tio.c_cflag &= (unsigned int)~CSTOPB;
 
         switch (config->stopbits) {
-        case 1:
-            break;
-        case 2:
-            tio.c_cflag |= CSTOPB;
-            break;
-        default:
-            return hs_error(HS_ERROR_SYSTEM, "Invalid stop bits setting: %u", config->stopbits);
+            case 1: {} break;
+            case 2: { tio.c_cflag |= CSTOPB; } break;
+
+            default: {
+                return hs_error(HS_ERROR_SYSTEM, "Invalid stop bits setting: %u",
+                                config->stopbits);
+            } break;
         }
     }
 
@@ -6315,28 +6298,22 @@ int hs_serial_set_config(hs_port *port, const hs_serial_config *config)
 #endif
 
         switch (config->parity) {
-        case HS_SERIAL_CONFIG_PARITY_OFF:
-            break;
-        case HS_SERIAL_CONFIG_PARITY_EVEN:
-            tio.c_cflag |= PARENB;
-            break;
-        case HS_SERIAL_CONFIG_PARITY_ODD:
-            tio.c_cflag |= PARENB | PARODD;
-            break;
+            case HS_SERIAL_CONFIG_PARITY_OFF: {} break;
+            case HS_SERIAL_CONFIG_PARITY_EVEN: { tio.c_cflag |= PARENB; } break;
+            case HS_SERIAL_CONFIG_PARITY_ODD: { tio.c_cflag |= PARENB | PARODD; } break;
 #ifdef CMSPAR
-        case HS_SERIAL_CONFIG_PARITY_SPACE:
-            tio.c_cflag |= PARENB | CMSPAR;
-            break;
-        case HS_SERIAL_CONFIG_PARITY_MARK:
-            tio.c_cflag |= PARENB | PARODD | CMSPAR;
-            break;
+            case HS_SERIAL_CONFIG_PARITY_SPACE: { tio.c_cflag |= PARENB | CMSPAR; } break;
+            case HS_SERIAL_CONFIG_PARITY_MARK: { tio.c_cflag |= PARENB | PARODD | CMSPAR; } break;
 #else
-        case HS_SERIAL_CONFIG_PARITY_MARK:
-        case HS_SERIAL_CONFIG_PARITY_SPACE:
-            return hs_error(HS_ERROR_SYSTEM, "Mark/space parity is not supported on this platform");
+
+            case HS_SERIAL_CONFIG_PARITY_MARK:
+            case HS_SERIAL_CONFIG_PARITY_SPACE: {
+                return hs_error(HS_ERROR_SYSTEM, "Mark/space parity is not supported");
+            } break;
 #endif
-        default:
-            return hs_error(HS_ERROR_SYSTEM, "Invalid parity setting: %d", config->parity);
+            default: {
+                return hs_error(HS_ERROR_SYSTEM, "Invalid parity setting: %d", config->parity);
+            } break;
         }
     }
 
@@ -6345,49 +6322,38 @@ int hs_serial_set_config(hs_port *port, const hs_serial_config *config)
         modem_bits &= ~TIOCM_RTS;
 
         switch (config->rts) {
-        case HS_SERIAL_CONFIG_RTS_OFF:
-            break;
-        case HS_SERIAL_CONFIG_RTS_ON:
-            modem_bits |= TIOCM_RTS;
-            break;
-        case HS_SERIAL_CONFIG_RTS_FLOW:
-            tio.c_cflag |= CRTSCTS;
-            break;
-        default:
-            return hs_error(HS_ERROR_SYSTEM, "Invalid RTS setting: %d", config->rts);
+            case HS_SERIAL_CONFIG_RTS_OFF: {} break;
+            case HS_SERIAL_CONFIG_RTS_ON: { modem_bits |= TIOCM_RTS; } break;
+            case HS_SERIAL_CONFIG_RTS_FLOW: { tio.c_cflag |= CRTSCTS; } break;
+
+            default: {
+                return hs_error(HS_ERROR_SYSTEM, "Invalid RTS setting: %d", config->rts);
+            } break;
         }
     }
 
     switch (config->dtr) {
-    case 0:
-        break;
-    case HS_SERIAL_CONFIG_DTR_OFF:
-        modem_bits &= ~TIOCM_DTR;
-        break;
-    case HS_SERIAL_CONFIG_DTR_ON:
-        modem_bits |= TIOCM_DTR;
-        break;
-    default:
-        return hs_error(HS_ERROR_SYSTEM, "Invalid DTR setting: %d", config->dtr);
+        case 0: {} break;
+        case HS_SERIAL_CONFIG_DTR_OFF: { modem_bits &= ~TIOCM_DTR; } break;
+        case HS_SERIAL_CONFIG_DTR_ON: { modem_bits |= TIOCM_DTR; } break;
+
+        default: {
+            return hs_error(HS_ERROR_SYSTEM, "Invalid DTR setting: %d", config->dtr);
+        } break;
     }
 
     if (config->xonxoff) {
         tio.c_iflag &= (unsigned int)~(IXON | IXOFF | IXANY);
 
         switch (config->xonxoff) {
-        case HS_SERIAL_CONFIG_XONXOFF_OFF:
-            break;
-        case HS_SERIAL_CONFIG_XONXOFF_IN:
-            tio.c_iflag |= IXOFF;
-            break;
-        case HS_SERIAL_CONFIG_XONXOFF_OUT:
-            tio.c_iflag |= IXON | IXANY;
-            break;
-        case HS_SERIAL_CONFIG_XONXOFF_INOUT:
-            tio.c_iflag |= IXOFF | IXON | IXANY;
-            break;
-        default:
-            return hs_error(HS_ERROR_SYSTEM, "Invalid XON/XOFF setting: %d", config->xonxoff);
+            case HS_SERIAL_CONFIG_XONXOFF_OFF: {} break;
+            case HS_SERIAL_CONFIG_XONXOFF_IN: { tio.c_iflag |= IXOFF; } break;
+            case HS_SERIAL_CONFIG_XONXOFF_OUT: { tio.c_iflag |= IXON | IXANY; } break;
+            case HS_SERIAL_CONFIG_XONXOFF_INOUT: { tio.c_iflag |= IXOFF | IXON | IXANY; } break;
+
+            default: {
+                return hs_error(HS_ERROR_SYSTEM, "Invalid XON/XOFF setting: %d", config->xonxoff);
+            } break;
         }
     }
 
@@ -6425,69 +6391,29 @@ int hs_serial_get_config(hs_port *port, hs_serial_config *config)
     memset(config, 0, sizeof(*config));
 
     switch (cfgetispeed(&tio)) {
-    case B110:
-        config->baudrate = 110;
-        break;
-    case B134:
-        config->baudrate = 134;
-        break;
-    case B150:
-        config->baudrate = 150;
-        break;
-    case B200:
-        config->baudrate = 200;
-        break;
-    case B300:
-        config->baudrate = 300;
-        break;
-    case B600:
-        config->baudrate = 600;
-        break;
-    case B1200:
-        config->baudrate = 1200;
-        break;
-    case B1800:
-        config->baudrate = 1800;
-        break;
-    case B2400:
-        config->baudrate = 2400;
-        break;
-    case B4800:
-        config->baudrate = 4800;
-        break;
-    case B9600:
-        config->baudrate = 9600;
-        break;
-    case B19200:
-        config->baudrate = 19200;
-        break;
-    case B38400:
-        config->baudrate = 38400;
-        break;
-    case B57600:
-        config->baudrate = 57600;
-        break;
-    case B115200:
-        config->baudrate = 115200;
-        break;
-    case B230400:
-        config->baudrate = 230400;
-        break;
+        case B110: { config->baudrate = 110; } break;
+        case B134: { config->baudrate = 134; } break;
+        case B150: { config->baudrate = 150; } break;
+        case B200: { config->baudrate = 200; } break;
+        case B300: { config->baudrate = 300; } break;
+        case B600: { config->baudrate = 600; } break;
+        case B1200: { config->baudrate = 1200; } break;
+        case B1800: { config->baudrate = 1800; } break;
+        case B2400: { config->baudrate = 2400; } break;
+        case B4800: { config->baudrate = 4800; } break;
+        case B9600: { config->baudrate = 9600; } break;
+        case B19200: { config->baudrate = 19200; } break;
+        case B38400: { config->baudrate = 38400; } break;
+        case B57600: { config->baudrate = 57600; } break;
+        case B115200: { config->baudrate = 115200; } break;
+        case B230400: { config->baudrate = 230400; } break;
     }
 
     switch (tio.c_cflag & CSIZE) {
-    case CS5:
-        config->databits = 5;
-        break;
-    case CS6:
-        config->databits = 6;
-        break;
-    case CS7:
-        config->databits = 7;
-        break;
-    case CS8:
-        config->databits = 8;
-        break;
+        case CS5: { config->databits = 5; } break;
+        case CS6: { config->databits = 6; } break;
+        case CS7: { config->databits = 7; } break;
+        case CS8: { config->databits = 8; } break;
     }
 
     if (tio.c_cflag & CSTOPB) {
@@ -6503,19 +6429,11 @@ int hs_serial_get_config(hs_port *port, hs_serial_config *config)
 #else
         switch (tio.c_cflag & PARODD) {
 #endif
-        case 0:
-            config->parity = HS_SERIAL_CONFIG_PARITY_EVEN;
-            break;
-        case PARODD:
-            config->parity = HS_SERIAL_CONFIG_PARITY_ODD;
-            break;
+            case 0: { config->parity = HS_SERIAL_CONFIG_PARITY_EVEN; } break;
+            case PARODD: { config->parity = HS_SERIAL_CONFIG_PARITY_ODD; } break;
 #ifdef CMSPAR
-        case CMSPAR:
-            config->parity = HS_SERIAL_CONFIG_PARITY_SPACE;
-            break;
-        case CMSPAR | PARODD:
-            config->parity = HS_SERIAL_CONFIG_PARITY_MARK;
-            break;
+            case CMSPAR: { config->parity = HS_SERIAL_CONFIG_PARITY_SPACE; } break;
+            case CMSPAR | PARODD: { config->parity = HS_SERIAL_CONFIG_PARITY_MARK; } break;
 #endif
         }
     } else {
@@ -6537,18 +6455,10 @@ int hs_serial_get_config(hs_port *port, hs_serial_config *config)
     }
 
     switch (tio.c_iflag & (IXON | IXOFF)) {
-    case 0:
-        config->xonxoff = HS_SERIAL_CONFIG_XONXOFF_OFF;
-        break;
-    case IXOFF:
-        config->xonxoff = HS_SERIAL_CONFIG_XONXOFF_IN;
-        break;
-    case IXON:
-        config->xonxoff = HS_SERIAL_CONFIG_XONXOFF_OUT;
-        break;
-    case IXOFF | IXON:
-        config->xonxoff = HS_SERIAL_CONFIG_XONXOFF_INOUT;
-        break;
+        case 0: { config->xonxoff = HS_SERIAL_CONFIG_XONXOFF_OFF; } break;
+        case IXOFF: { config->xonxoff = HS_SERIAL_CONFIG_XONXOFF_IN; } break;
+        case IXON: { config->xonxoff = HS_SERIAL_CONFIG_XONXOFF_OUT; } break;
+        case IXOFF | IXON: { config->xonxoff = HS_SERIAL_CONFIG_XONXOFF_INOUT; } break;
     }
 
     return 0;
@@ -6683,48 +6593,46 @@ int _hs_open_file_port(hs_device *dev, hs_port_mode mode, hs_port **rport)
 
     fd_flags = O_CLOEXEC | O_NOCTTY | O_NONBLOCK;
     switch (mode) {
-    case HS_PORT_MODE_READ:
-        fd_flags |= O_RDONLY;
-        break;
-    case HS_PORT_MODE_WRITE:
-        fd_flags |= O_WRONLY;
-        break;
-    case HS_PORT_MODE_RW:
-        fd_flags |= O_RDWR;
-        break;
+        case HS_PORT_MODE_READ: { fd_flags |= O_RDONLY; } break;
+        case HS_PORT_MODE_WRITE: { fd_flags |= O_WRONLY; } break;
+        case HS_PORT_MODE_RW: { fd_flags |= O_RDWR; } break;
     }
 
 restart:
     port->u.file.fd = open(dev->path, fd_flags);
     if (port->u.file.fd < 0) {
         switch (errno) {
-        case EINTR:
-            goto restart;
-        case EACCES:
-            r = hs_error(HS_ERROR_ACCESS, "Permission denied for device '%s'", dev->path);
-            break;
-        case EIO:
-        case ENXIO:
-        case ENODEV:
-            r = hs_error(HS_ERROR_IO, "I/O error while opening device '%s'", dev->path);
-            break;
-        case ENOENT:
-        case ENOTDIR:
-            r = hs_error(HS_ERROR_NOT_FOUND, "Device '%s' not found", dev->path);
-            break;
+            case EINTR: {
+                goto restart;
+            } break;
+
+            case EACCES: {
+                r = hs_error(HS_ERROR_ACCESS, "Permission denied for device '%s'", dev->path);
+            } break;
+            case EIO:
+            case ENXIO:
+            case ENODEV: {
+                r = hs_error(HS_ERROR_IO, "I/O error while opening device '%s'", dev->path);
+            } break;
+            case ENOENT:
+            case ENOTDIR: {
+                r = hs_error(HS_ERROR_NOT_FOUND, "Device '%s' not found", dev->path);
+            } break;
 
 #ifdef __APPLE__
-        /* On El Capitan (and maybe before), the open fails for some time (around 40 - 50 ms on my
-           computer) after the device notification. */
-        case EBUSY:
-            if (retry--) {
-                usleep(20000);
-                goto restart;
-            }
+            /* On El Capitan (and maybe before), the open fails for some time (around 40 - 50 ms
+               on my computer) after the device notification. */
+            case EBUSY: {
+                if (retry--) {
+                    usleep(20000);
+                    goto restart;
+                }
+            } // fallthrough
 #endif
-        default:
-            r = hs_error(HS_ERROR_SYSTEM, "open('%s') failed: %s", dev->path, strerror(errno));
-            break;
+
+            default: {
+                r = hs_error(HS_ERROR_SYSTEM, "open('%s') failed: %s", dev->path, strerror(errno));
+            } break;
         }
         goto error;
     }
@@ -6987,12 +6895,12 @@ restart:
 #include <sys/ioctl.h>
 #include <unistd.h>
 // #include "device_priv.h"
-// #include "filter_priv.h"
+// #include "match_priv.h"
 // #include "monitor_priv.h"
 // #include "platform.h"
 
 struct hs_monitor {
-    _hs_filter filter;
+    _hs_match_helper match_helper;
     _hs_htable devices;
 
     struct udev_monitor *udev_mon;
@@ -7218,49 +7126,49 @@ static void parse_hid_descriptor(hs_device *dev, uint8_t *desc, size_t desc_size
 
         // little endian
         switch (item_size) {
-        case 0:
-            item_data = 0;
-            break;
-        case 1:
-            item_data = desc[i + 1];
-            break;
-        case 2:
-            item_data = (uint32_t)(desc[i + 2] << 8) | desc[i + 1];
-            break;
-        case 4:
-            item_data = (uint32_t)((desc[i + 4] << 24) | (desc[i + 3] << 16)
-                | (desc[i + 2] << 8) | desc[i + 1]);
-            break;
+            case 0: {
+                item_data = 0;
+            } break;
+            case 1: {
+                item_data = desc[i + 1];
+            } break;
+            case 2: {
+                item_data = (uint32_t)(desc[i + 2] << 8) | desc[i + 1];
+            } break;
+            case 4: {
+                item_data = (uint32_t)((desc[i + 4] << 24) | (desc[i + 3] << 16) |
+                                       (desc[i + 2] << 8) | desc[i + 1]);
+            } break;
 
-        // silence unitialized warning
-        default:
-            item_data = 0;
-            break;
+            // silence unitialized warning
+            default: {
+                item_data = 0;
+            } break;
         }
 
         switch (item_type) {
-        // main items
-        case 0xA0:
-            collection_depth++;
-            break;
-        case 0xC0:
-            collection_depth--;
-            break;
+            // main items
+            case 0xA0: {
+                collection_depth++;
+            } break;
+            case 0xC0: {
+                collection_depth--;
+            } break;
 
-        // global items
-        case 0x84:
-            dev->u.hid.numbered_reports = true;
-            break;
-        case 0x04:
-            if (!collection_depth)
-                dev->u.hid.usage_page = (uint16_t)item_data;
-            break;
+            // global items
+            case 0x84: {
+                dev->u.hid.numbered_reports = true;
+            } break;
+            case 0x04: {
+                if (!collection_depth)
+                    dev->u.hid.usage_page = (uint16_t)item_data;
+            } break;
 
-        // local items
-        case 0x08:
-            if (!collection_depth)
-                dev->u.hid.usage = (uint16_t)item_data;
-            break;
+            // local items
+            case 0x08: {
+                if (!collection_depth)
+                    dev->u.hid.usage = (uint16_t)item_data;
+            } break;
         }
     }
 }
@@ -7369,7 +7277,7 @@ cleanup:
     return r;
 }
 
-static int enumerate(_hs_filter *filter, hs_enumerate_func *f, void *udata)
+static int enumerate(_hs_match_helper *match_helper, hs_enumerate_func *f, void *udata)
 {
     struct udev_enumerate *enumerate;
     int r;
@@ -7382,7 +7290,7 @@ static int enumerate(_hs_filter *filter, hs_enumerate_func *f, void *udata)
 
     udev_enumerate_add_match_is_initialized(enumerate);
     for (unsigned int i = 0; device_subsystems[i].subsystem; i++) {
-        if (_hs_filter_has_type(filter, device_subsystems[i].type)) {
+        if (_hs_match_helper_has_type(match_helper, device_subsystems[i].type)) {
             r = udev_enumerate_add_match_subsystem(enumerate, device_subsystems[i].subsystem);
             if (r < 0) {
                 r = hs_error(HS_ERROR_MEMORY, NULL);
@@ -7419,7 +7327,7 @@ static int enumerate(_hs_filter *filter, hs_enumerate_func *f, void *udata)
         if (!r)
             continue;
 
-        if (_hs_filter_match_device(filter, dev)) {
+        if (_hs_match_helper_match(match_helper, dev, &dev->match_udata)) {
             r = (*f)(dev, udata);
             hs_device_unref(dev);
             if (r)
@@ -7448,12 +7356,12 @@ static int enumerate_enumerate_callback(hs_device *dev, void *udata)
     return (*ctx->f)(dev, ctx->udata);
 }
 
-int hs_enumerate(const hs_match *matches, unsigned int count, hs_enumerate_func *f,
+int hs_enumerate(const hs_match_spec *matches, unsigned int count, hs_enumerate_func *f,
                  void *udata)
 {
     assert(f);
 
-    _hs_filter filter = {0};
+    _hs_match_helper match_helper = {0};
     struct enumerate_enumerate_context ctx;
     int r;
 
@@ -7461,20 +7369,20 @@ int hs_enumerate(const hs_match *matches, unsigned int count, hs_enumerate_func 
     if (r < 0)
         return r;
 
-    r = _hs_filter_init(&filter, matches, count);
+    r = _hs_match_helper_init(&match_helper, matches, count);
     if (r < 0)
         return r;
 
     ctx.f = f;
     ctx.udata = udata;
 
-    r = enumerate(&filter, enumerate_enumerate_callback, &ctx);
+    r = enumerate(&match_helper, enumerate_enumerate_callback, &ctx);
 
-    _hs_filter_release(&filter);
+    _hs_match_helper_release(&match_helper);
     return r;
 }
 
-int hs_monitor_new(const hs_match *matches, unsigned int count, hs_monitor **rmonitor)
+int hs_monitor_new(const hs_match_spec *matches, unsigned int count, hs_monitor **rmonitor)
 {
     assert(rmonitor);
 
@@ -7488,7 +7396,7 @@ int hs_monitor_new(const hs_match *matches, unsigned int count, hs_monitor **rmo
     }
     monitor->wait_fd = -1;
 
-    r = _hs_filter_init(&monitor->filter, matches, count);
+    r = _hs_match_helper_init(&monitor->match_helper, matches, count);
     if (r < 0)
         goto error;
 
@@ -7522,7 +7430,7 @@ void hs_monitor_free(hs_monitor *monitor)
 
         _hs_monitor_clear_devices(&monitor->devices);
         _hs_htable_release(&monitor->devices);
-        _hs_filter_release(&monitor->filter);
+        _hs_match_helper_release(&monitor->match_helper);
     }
 
     free(monitor);
@@ -7531,9 +7439,6 @@ void hs_monitor_free(hs_monitor *monitor)
 static int monitor_enumerate_callback(hs_device *dev, void *udata)
 {
     hs_monitor *monitor = (hs_monitor *)udata;
-
-    if (!_hs_filter_match_device(&monitor->filter, dev))
-        return 0;
     return _hs_monitor_add(&monitor->devices, dev, NULL, NULL);
 }
 
@@ -7553,7 +7458,7 @@ int hs_monitor_start(hs_monitor *monitor)
     }
 
     for (unsigned int i = 0; device_subsystems[i].subsystem; i++) {
-        if (_hs_filter_has_type(&monitor->filter, device_subsystems[i].type)) {
+        if (_hs_match_helper_has_type(&monitor->match_helper, device_subsystems[i].type)) {
             r = udev_monitor_filter_add_match_subsystem_devtype(monitor->udev_mon, device_subsystems[i].subsystem, NULL);
             if (r < 0) {
                 r = hs_error(HS_ERROR_SYSTEM, "udev_monitor_filter_add_match_subsystem_devtype() failed");
@@ -7568,7 +7473,7 @@ int hs_monitor_start(hs_monitor *monitor)
         goto error;
     }
 
-    r = enumerate(&monitor->filter, monitor_enumerate_callback, monitor);
+    r = enumerate(&monitor->match_helper, monitor_enumerate_callback, monitor);
     if (r < 0)
         goto error;
 
@@ -7623,7 +7528,7 @@ int hs_monitor_refresh(hs_monitor *monitor, hs_enumerate_func *f, void *udata)
 
             r = read_device_information(udev_dev, &dev);
             if (r > 0) {
-                r = _hs_filter_match_device(&monitor->filter, dev);
+                r = _hs_match_helper_match(&monitor->match_helper, dev, &dev->match_udata);
                 if (r)
                     r = _hs_monitor_add(&monitor->devices, dev, f, udata);
             }
@@ -7763,56 +7668,27 @@ int hs_serial_set_config(hs_port *port, const hs_serial_config *config)
         speed_t std_baudrate;
 
         switch (config->baudrate) {
-        case 110:
-            std_baudrate = B110;
-            break;
-        case 134:
-            std_baudrate = B134;
-            break;
-        case 150:
-            std_baudrate = B150;
-            break;
-        case 200:
-            std_baudrate = B200;
-            break;
-        case 300:
-            std_baudrate = B300;
-            break;
-        case 600:
-            std_baudrate = B600;
-            break;
-        case 1200:
-            std_baudrate = B1200;
-            break;
-        case 1800:
-            std_baudrate = B1800;
-            break;
-        case 2400:
-            std_baudrate = B2400;
-            break;
-        case 4800:
-            std_baudrate = B4800;
-            break;
-        case 9600:
-            std_baudrate = B9600;
-            break;
-        case 19200:
-            std_baudrate = B19200;
-            break;
-        case 38400:
-            std_baudrate = B38400;
-            break;
-        case 57600:
-            std_baudrate = B57600;
-            break;
-        case 115200:
-            std_baudrate = B115200;
-            break;
-        case 230400:
-            std_baudrate = B230400;
-            break;
-        default:
-            return hs_error(HS_ERROR_SYSTEM, "Unsupported baud rate value: %u", config->baudrate);
+            case 110: { std_baudrate = B110; } break;
+            case 134: { std_baudrate = B134; } break;
+            case 150: { std_baudrate = B150; } break;
+            case 200: { std_baudrate = B200; } break;
+            case 300: { std_baudrate = B300; } break;
+            case 600: { std_baudrate = B600; } break;
+            case 1200: { std_baudrate = B1200; } break;
+            case 1800: { std_baudrate = B1800; } break;
+            case 2400: { std_baudrate = B2400; } break;
+            case 4800: { std_baudrate = B4800; } break;
+            case 9600: { std_baudrate = B9600; } break;
+            case 19200: { std_baudrate = B19200; } break;
+            case 38400: { std_baudrate = B38400; } break;
+            case 57600: { std_baudrate = B57600; } break;
+            case 115200: { std_baudrate = B115200; } break;
+            case 230400: { std_baudrate = B230400; } break;
+
+            default: {
+                return hs_error(HS_ERROR_SYSTEM, "Unsupported baud rate value: %u",
+                                config->baudrate);
+            } break;
         }
 
         cfsetispeed(&tio, std_baudrate);
@@ -7823,20 +7699,15 @@ int hs_serial_set_config(hs_port *port, const hs_serial_config *config)
         tio.c_cflag &= (unsigned int)~CSIZE;
 
         switch (config->databits) {
-        case 5:
-            tio.c_cflag |= CS5;
-            break;
-        case 6:
-            tio.c_cflag |= CS6;
-            break;
-        case 7:
-            tio.c_cflag |= CS7;
-            break;
-        case 8:
-            tio.c_cflag |= CS8;
-            break;
-        default:
-            return hs_error(HS_ERROR_SYSTEM, "Invalid data bits setting: %u", config->databits);
+            case 5: { tio.c_cflag |= CS5; } break;
+            case 6: { tio.c_cflag |= CS6; } break;
+            case 7: { tio.c_cflag |= CS7; } break;
+            case 8: { tio.c_cflag |= CS8; } break;
+
+            default: {
+                return hs_error(HS_ERROR_SYSTEM, "Invalid data bits setting: %u",
+                                config->databits);
+            } break;
         }
     }
 
@@ -7844,13 +7715,13 @@ int hs_serial_set_config(hs_port *port, const hs_serial_config *config)
         tio.c_cflag &= (unsigned int)~CSTOPB;
 
         switch (config->stopbits) {
-        case 1:
-            break;
-        case 2:
-            tio.c_cflag |= CSTOPB;
-            break;
-        default:
-            return hs_error(HS_ERROR_SYSTEM, "Invalid stop bits setting: %u", config->stopbits);
+            case 1: {} break;
+            case 2: { tio.c_cflag |= CSTOPB; } break;
+
+            default: {
+                return hs_error(HS_ERROR_SYSTEM, "Invalid stop bits setting: %u",
+                                config->stopbits);
+            } break;
         }
     }
 
@@ -7861,28 +7732,22 @@ int hs_serial_set_config(hs_port *port, const hs_serial_config *config)
 #endif
 
         switch (config->parity) {
-        case HS_SERIAL_CONFIG_PARITY_OFF:
-            break;
-        case HS_SERIAL_CONFIG_PARITY_EVEN:
-            tio.c_cflag |= PARENB;
-            break;
-        case HS_SERIAL_CONFIG_PARITY_ODD:
-            tio.c_cflag |= PARENB | PARODD;
-            break;
+            case HS_SERIAL_CONFIG_PARITY_OFF: {} break;
+            case HS_SERIAL_CONFIG_PARITY_EVEN: { tio.c_cflag |= PARENB; } break;
+            case HS_SERIAL_CONFIG_PARITY_ODD: { tio.c_cflag |= PARENB | PARODD; } break;
 #ifdef CMSPAR
-        case HS_SERIAL_CONFIG_PARITY_SPACE:
-            tio.c_cflag |= PARENB | CMSPAR;
-            break;
-        case HS_SERIAL_CONFIG_PARITY_MARK:
-            tio.c_cflag |= PARENB | PARODD | CMSPAR;
-            break;
+            case HS_SERIAL_CONFIG_PARITY_SPACE: { tio.c_cflag |= PARENB | CMSPAR; } break;
+            case HS_SERIAL_CONFIG_PARITY_MARK: { tio.c_cflag |= PARENB | PARODD | CMSPAR; } break;
 #else
-        case HS_SERIAL_CONFIG_PARITY_MARK:
-        case HS_SERIAL_CONFIG_PARITY_SPACE:
-            return hs_error(HS_ERROR_SYSTEM, "Mark/space parity is not supported on this platform");
+
+            case HS_SERIAL_CONFIG_PARITY_MARK:
+            case HS_SERIAL_CONFIG_PARITY_SPACE: {
+                return hs_error(HS_ERROR_SYSTEM, "Mark/space parity is not supported");
+            } break;
 #endif
-        default:
-            return hs_error(HS_ERROR_SYSTEM, "Invalid parity setting: %d", config->parity);
+            default: {
+                return hs_error(HS_ERROR_SYSTEM, "Invalid parity setting: %d", config->parity);
+            } break;
         }
     }
 
@@ -7891,49 +7756,38 @@ int hs_serial_set_config(hs_port *port, const hs_serial_config *config)
         modem_bits &= ~TIOCM_RTS;
 
         switch (config->rts) {
-        case HS_SERIAL_CONFIG_RTS_OFF:
-            break;
-        case HS_SERIAL_CONFIG_RTS_ON:
-            modem_bits |= TIOCM_RTS;
-            break;
-        case HS_SERIAL_CONFIG_RTS_FLOW:
-            tio.c_cflag |= CRTSCTS;
-            break;
-        default:
-            return hs_error(HS_ERROR_SYSTEM, "Invalid RTS setting: %d", config->rts);
+            case HS_SERIAL_CONFIG_RTS_OFF: {} break;
+            case HS_SERIAL_CONFIG_RTS_ON: { modem_bits |= TIOCM_RTS; } break;
+            case HS_SERIAL_CONFIG_RTS_FLOW: { tio.c_cflag |= CRTSCTS; } break;
+
+            default: {
+                return hs_error(HS_ERROR_SYSTEM, "Invalid RTS setting: %d", config->rts);
+            } break;
         }
     }
 
     switch (config->dtr) {
-    case 0:
-        break;
-    case HS_SERIAL_CONFIG_DTR_OFF:
-        modem_bits &= ~TIOCM_DTR;
-        break;
-    case HS_SERIAL_CONFIG_DTR_ON:
-        modem_bits |= TIOCM_DTR;
-        break;
-    default:
-        return hs_error(HS_ERROR_SYSTEM, "Invalid DTR setting: %d", config->dtr);
+        case 0: {} break;
+        case HS_SERIAL_CONFIG_DTR_OFF: { modem_bits &= ~TIOCM_DTR; } break;
+        case HS_SERIAL_CONFIG_DTR_ON: { modem_bits |= TIOCM_DTR; } break;
+
+        default: {
+            return hs_error(HS_ERROR_SYSTEM, "Invalid DTR setting: %d", config->dtr);
+        } break;
     }
 
     if (config->xonxoff) {
         tio.c_iflag &= (unsigned int)~(IXON | IXOFF | IXANY);
 
         switch (config->xonxoff) {
-        case HS_SERIAL_CONFIG_XONXOFF_OFF:
-            break;
-        case HS_SERIAL_CONFIG_XONXOFF_IN:
-            tio.c_iflag |= IXOFF;
-            break;
-        case HS_SERIAL_CONFIG_XONXOFF_OUT:
-            tio.c_iflag |= IXON | IXANY;
-            break;
-        case HS_SERIAL_CONFIG_XONXOFF_INOUT:
-            tio.c_iflag |= IXOFF | IXON | IXANY;
-            break;
-        default:
-            return hs_error(HS_ERROR_SYSTEM, "Invalid XON/XOFF setting: %d", config->xonxoff);
+            case HS_SERIAL_CONFIG_XONXOFF_OFF: {} break;
+            case HS_SERIAL_CONFIG_XONXOFF_IN: { tio.c_iflag |= IXOFF; } break;
+            case HS_SERIAL_CONFIG_XONXOFF_OUT: { tio.c_iflag |= IXON | IXANY; } break;
+            case HS_SERIAL_CONFIG_XONXOFF_INOUT: { tio.c_iflag |= IXOFF | IXON | IXANY; } break;
+
+            default: {
+                return hs_error(HS_ERROR_SYSTEM, "Invalid XON/XOFF setting: %d", config->xonxoff);
+            } break;
         }
     }
 
@@ -7971,69 +7825,29 @@ int hs_serial_get_config(hs_port *port, hs_serial_config *config)
     memset(config, 0, sizeof(*config));
 
     switch (cfgetispeed(&tio)) {
-    case B110:
-        config->baudrate = 110;
-        break;
-    case B134:
-        config->baudrate = 134;
-        break;
-    case B150:
-        config->baudrate = 150;
-        break;
-    case B200:
-        config->baudrate = 200;
-        break;
-    case B300:
-        config->baudrate = 300;
-        break;
-    case B600:
-        config->baudrate = 600;
-        break;
-    case B1200:
-        config->baudrate = 1200;
-        break;
-    case B1800:
-        config->baudrate = 1800;
-        break;
-    case B2400:
-        config->baudrate = 2400;
-        break;
-    case B4800:
-        config->baudrate = 4800;
-        break;
-    case B9600:
-        config->baudrate = 9600;
-        break;
-    case B19200:
-        config->baudrate = 19200;
-        break;
-    case B38400:
-        config->baudrate = 38400;
-        break;
-    case B57600:
-        config->baudrate = 57600;
-        break;
-    case B115200:
-        config->baudrate = 115200;
-        break;
-    case B230400:
-        config->baudrate = 230400;
-        break;
+        case B110: { config->baudrate = 110; } break;
+        case B134: { config->baudrate = 134; } break;
+        case B150: { config->baudrate = 150; } break;
+        case B200: { config->baudrate = 200; } break;
+        case B300: { config->baudrate = 300; } break;
+        case B600: { config->baudrate = 600; } break;
+        case B1200: { config->baudrate = 1200; } break;
+        case B1800: { config->baudrate = 1800; } break;
+        case B2400: { config->baudrate = 2400; } break;
+        case B4800: { config->baudrate = 4800; } break;
+        case B9600: { config->baudrate = 9600; } break;
+        case B19200: { config->baudrate = 19200; } break;
+        case B38400: { config->baudrate = 38400; } break;
+        case B57600: { config->baudrate = 57600; } break;
+        case B115200: { config->baudrate = 115200; } break;
+        case B230400: { config->baudrate = 230400; } break;
     }
 
     switch (tio.c_cflag & CSIZE) {
-    case CS5:
-        config->databits = 5;
-        break;
-    case CS6:
-        config->databits = 6;
-        break;
-    case CS7:
-        config->databits = 7;
-        break;
-    case CS8:
-        config->databits = 8;
-        break;
+        case CS5: { config->databits = 5; } break;
+        case CS6: { config->databits = 6; } break;
+        case CS7: { config->databits = 7; } break;
+        case CS8: { config->databits = 8; } break;
     }
 
     if (tio.c_cflag & CSTOPB) {
@@ -8049,19 +7863,11 @@ int hs_serial_get_config(hs_port *port, hs_serial_config *config)
 #else
         switch (tio.c_cflag & PARODD) {
 #endif
-        case 0:
-            config->parity = HS_SERIAL_CONFIG_PARITY_EVEN;
-            break;
-        case PARODD:
-            config->parity = HS_SERIAL_CONFIG_PARITY_ODD;
-            break;
+            case 0: { config->parity = HS_SERIAL_CONFIG_PARITY_EVEN; } break;
+            case PARODD: { config->parity = HS_SERIAL_CONFIG_PARITY_ODD; } break;
 #ifdef CMSPAR
-        case CMSPAR:
-            config->parity = HS_SERIAL_CONFIG_PARITY_SPACE;
-            break;
-        case CMSPAR | PARODD:
-            config->parity = HS_SERIAL_CONFIG_PARITY_MARK;
-            break;
+            case CMSPAR: { config->parity = HS_SERIAL_CONFIG_PARITY_SPACE; } break;
+            case CMSPAR | PARODD: { config->parity = HS_SERIAL_CONFIG_PARITY_MARK; } break;
 #endif
         }
     } else {
@@ -8083,18 +7889,10 @@ int hs_serial_get_config(hs_port *port, hs_serial_config *config)
     }
 
     switch (tio.c_iflag & (IXON | IXOFF)) {
-    case 0:
-        config->xonxoff = HS_SERIAL_CONFIG_XONXOFF_OFF;
-        break;
-    case IXOFF:
-        config->xonxoff = HS_SERIAL_CONFIG_XONXOFF_IN;
-        break;
-    case IXON:
-        config->xonxoff = HS_SERIAL_CONFIG_XONXOFF_OUT;
-        break;
-    case IXOFF | IXON:
-        config->xonxoff = HS_SERIAL_CONFIG_XONXOFF_INOUT;
-        break;
+        case 0: { config->xonxoff = HS_SERIAL_CONFIG_XONXOFF_OFF; } break;
+        case IXOFF: { config->xonxoff = HS_SERIAL_CONFIG_XONXOFF_IN; } break;
+        case IXON: { config->xonxoff = HS_SERIAL_CONFIG_XONXOFF_OUT; } break;
+        case IXOFF | IXON: { config->xonxoff = HS_SERIAL_CONFIG_XONXOFF_INOUT; } break;
     }
 
     return 0;
