@@ -1,6 +1,6 @@
 /* libhs - public domain
    Niels Martignène <niels.martignene@protonmail.com>
-   https://neodd.com/libraries
+   https://koromix.dev/libhs
 
    This software is in the public domain. Where that dedication is not
    recognized, you are granted a perpetual, irrevocable license to copy,
@@ -566,6 +566,8 @@ struct hs_device {
     uint16_t vid;
     /** Device product identifier. */
     uint16_t pid;
+    /** Device bcd. */
+    uint16_t bcd_device;
     /** Device manufacturer string, or NULL if not available. */
     char *manufacturer_string;
     /** Device product string, or NULL if not available. */
@@ -587,7 +589,11 @@ struct hs_device {
             /** Primary usage value read from the HID report descriptor. */
             uint16_t usage;
 
-#ifdef __linux__
+#if defined(WIN32)
+            /** @cond */
+            size_t input_report_len;
+            /** @endcond */
+#elif defined(__linux__)
             /** @cond */
             // Needed to work around a bug on old Linux kernels
             bool numbered_reports;
@@ -1602,6 +1608,7 @@ struct hs_port {
             void *h; // HANDLE
 
             struct _OVERLAPPED *read_ov;
+            size_t read_buf_size;
             uint8_t *read_buf;
             uint8_t *read_ptr;
             size_t read_len;
@@ -2498,16 +2505,24 @@ int _hs_open_file_port(hs_device *dev, hs_port_mode mode, hs_port **rport)
             goto error;
         }
 
-        port->u.handle.read_buf = (uint8_t *)malloc(READ_BUFFER_SIZE);
-        if (!port->u.handle.read_buf) {
-            r = hs_error(HS_ERROR_MEMORY, NULL);
-            goto error;
+        if (dev->type == HS_DEVICE_TYPE_HID) {
+            port->u.handle.read_buf_size = dev->u.hid.input_report_len;
+        } else {
+            port->u.handle.read_buf_size = READ_BUFFER_SIZE;
         }
 
-        _hs_win32_start_async_read(port);
-        if (port->u.handle.read_status < 0) {
-            r = port->u.handle.read_status;
-            goto error;
+        if (port->u.handle.read_buf_size) {
+            port->u.handle.read_buf = (uint8_t *)malloc(port->u.handle.read_buf_size);
+            if (!port->u.handle.read_buf) {
+                r = hs_error(HS_ERROR_MEMORY, NULL);
+                goto error;
+            }
+
+            _hs_win32_start_async_read(port);
+            if (port->u.handle.read_status < 0) {
+                r = port->u.handle.read_status;
+                goto error;
+            }
         }
     }
 
@@ -2625,8 +2640,8 @@ void _hs_win32_start_async_read(hs_port *port)
 {
     DWORD ret;
 
-    ret = (DWORD)ReadFile(port->u.handle.h, port->u.handle.read_buf, READ_BUFFER_SIZE, NULL,
-                          port->u.handle.read_ov);
+    ret = (DWORD)ReadFile(port->u.handle.h, port->u.handle.read_buf,
+                          (DWORD)port->u.handle.read_buf_size, NULL, port->u.handle.read_ov);
     if (!ret && GetLastError() != ERROR_IO_PENDING) {
         CancelIo(port->u.handle.h);
 
@@ -2643,9 +2658,11 @@ void _hs_win32_finalize_async_read(hs_port *port, int timeout)
 {
     DWORD len, ret;
 
+    if (!port->u.handle.read_buf_size)
+        return;
+
     if (timeout > 0)
         WaitForSingleObject(port->u.handle.read_ov->hEvent, (DWORD)timeout);
-
     ret = (DWORD)GetOverlappedResult(port->u.handle.h, port->u.handle.read_ov, &len, timeout < 0);
     if (!ret) {
         if (GetLastError() == ERROR_IO_INCOMPLETE) {
@@ -3402,19 +3419,21 @@ static int read_hid_properties(hs_device *dev, const USB_DEVICE_DESCRIPTOR *desc
         lret = HidD_GetPreparsedData(h, &pp);
         if (!lret) {
             hs_log(HS_LOG_WARNING, "HidD_GetPreparsedData() failed on '%s", dev->path);
-            goto ignore_hid_descriptor;
+            r = 0;
+            goto cleanup;
         }
         lret = HidP_GetCaps(pp, &caps);
         HidD_FreePreparsedData(pp);
         if (lret != HIDP_STATUS_SUCCESS) {
             hs_log(HS_LOG_WARNING, "Invalid HID descriptor from '%s", dev->path);
-            goto ignore_hid_descriptor;
+            r = 0;
+            goto cleanup;
         }
 
         dev->u.hid.usage_page = caps.UsagePage;
         dev->u.hid.usage = caps.Usage;
+        dev->u.hid.input_report_len = caps.InputReportByteLength;
     }
-ignore_hid_descriptor:
 
     r = 1;
 cleanup:
@@ -3567,6 +3586,9 @@ static int read_device_properties(hs_device *dev, DEVINST inst, uint8_t port)
         r = 1;
         goto cleanup;
     }
+
+    // Get additional properties
+    dev->bcd_device = node->DeviceDescriptor.bcdDevice;
 
     /* Descriptor requests to USB devices underlying HID devices fail most (all?) of the time,
        so we need a different technique here. We still need the device descriptor because the
@@ -5436,10 +5458,8 @@ struct hs_monitor {
 };
 
 struct device_class {
-    const char *old_stack;
-    const char *new_stack;
-
     hs_device_type type;
+    const char *stacks[3];
 };
 
 struct service_aggregate {
@@ -5449,26 +5469,30 @@ struct service_aggregate {
 };
 
 static struct device_class device_classes[] = {
-    {"IOHIDDevice",       "IOUSBHostHIDDevice", HS_DEVICE_TYPE_HID},
-    {"IOSerialBSDClient", "IOSerialBSDClient",  HS_DEVICE_TYPE_SERIAL},
-    {NULL}
+    {HS_DEVICE_TYPE_HID,    {"IOHIDDevice",       "IOUSBHostHIDDevice", "AppleUserHIDDevice"}},
+    {HS_DEVICE_TYPE_SERIAL, {"IOSerialBSDClient", "IOSerialBSDClient",  "IOSerialBSDClient"}}
 };
 
-static bool uses_new_stack()
+static int get_stack_version()
 {
-    static bool init, new_stack;
+    static bool init;
+    static int stack_version;
 
     if (!init) {
-        new_stack = hs_darwin_version() >= 150000;
+        uint32_t version = hs_darwin_version();
+
+        if (version >= 190000) {
+            stack_version = 2;
+        } else if (version >= 150000) {
+            stack_version = 1;
+        } else {
+            stack_version = 0;
+        }
+
         init = true;
     }
 
-    return new_stack;
-}
-
-static const char *correct_class(const char *new_stack, const char *old_stack)
-{
-    return uses_new_stack() ? new_stack : old_stack;
+    return stack_version;
 }
 
 static int get_ioregistry_value_string(io_service_t service, CFStringRef prop, char **rs)
@@ -5671,9 +5695,11 @@ static int fill_device_details(struct service_aggregate *agg, hs_device *dev)
             return r;
 
     GET_MANDATORY_PROPERTY_NUMBER(agg->usb_service, "sessionID", kCFNumberSInt64Type, &session);
-    GET_MANDATORY_PROPERTY_NUMBER(agg->usb_service, "idVendor", kCFNumberSInt64Type, &dev->vid);
-    GET_MANDATORY_PROPERTY_NUMBER(agg->usb_service, "idProduct", kCFNumberSInt64Type, &dev->pid);
-    GET_MANDATORY_PROPERTY_NUMBER(agg->iface_service, "bInterfaceNumber", kCFNumberSInt64Type,
+    GET_MANDATORY_PROPERTY_NUMBER(agg->usb_service, "idVendor", kCFNumberSInt16Type, &dev->vid);
+    GET_MANDATORY_PROPERTY_NUMBER(agg->usb_service, "idProduct", kCFNumberSInt16Type, &dev->pid);
+    GET_MANDATORY_PROPERTY_NUMBER(agg->usb_service, "bcdDevice", kCFNumberSInt16Type,
+                                  &dev->bcd_device);
+    GET_MANDATORY_PROPERTY_NUMBER(agg->iface_service, "bInterfaceNumber", kCFNumberSInt8Type,
                                   &dev->iface_number);
 
     GET_OPTIONAL_PROPERTY_STRING(agg->usb_service, "USB Vendor Name", &dev->manufacturer_string);
@@ -5683,7 +5709,7 @@ static int fill_device_details(struct service_aggregate *agg, hs_device *dev)
 #undef GET_MANDATORY_PROPERTY_NUMBER
 #undef GET_OPTIONAL_PROPERTY_STRING
 
-    r = _hs_asprintf(&dev->key, "%"PRIx64, session);
+    r = _hs_asprintf(&dev->key, "%" PRIx64, session);
     if (r < 0)
         return hs_error(HS_ERROR_MEMORY, NULL);
 
@@ -5812,7 +5838,7 @@ static void darwin_devices_detached(void *udata, io_iterator_t it)
         if (r) {
             char key[32];
 
-            sprintf(key, "%"PRIx64, session);
+            sprintf(key, "%" PRIx64, session);
             _hs_monitor_remove(&monitor->devices, key, monitor->callback, monitor->callback_udata);
         }
 
@@ -5850,9 +5876,9 @@ int hs_enumerate(const hs_match_spec *matches, unsigned int count, hs_enumerate_
     ctx.f = f;
     ctx.udata = udata;
 
-    for (unsigned int i = 0; device_classes[i].old_stack; i++) {
+    for (unsigned int i = 0; i < _HS_COUNTOF(device_classes); i++) {
         if (_hs_match_helper_has_type(&match_helper, device_classes[i].type)) {
-            const char *cls = correct_class(device_classes[i].new_stack, device_classes[i].old_stack);
+            const char *cls = device_classes[i].stacks[get_stack_version()];
 
             kret = IOServiceGetMatchingServices(kIOMasterPortDefault, IOServiceMatching(cls), &it);
             if (kret != kIOReturnSuccess) {
@@ -6008,10 +6034,12 @@ int hs_monitor_start(hs_monitor *monitor)
     if (monitor->started)
         return 0;
 
-    for (unsigned int i = 0; device_classes[i].old_stack; i++) {
+    for (unsigned int i = 0; i < _HS_COUNTOF(device_classes); i++) {
         if (_hs_match_helper_has_type(&monitor->match_helper, device_classes[i].type)) {
-            r = add_notification(monitor, correct_class(device_classes[i].new_stack, device_classes[i].old_stack),
-                                 kIOFirstMatchNotification, darwin_devices_attached, &it);
+            const char *cls = device_classes[i].stacks[get_stack_version()];
+
+            r = add_notification(monitor, cls, kIOFirstMatchNotification,
+                                 darwin_devices_attached, &it);
             if (r < 0)
                 goto error;
 
@@ -6021,7 +6049,7 @@ int hs_monitor_start(hs_monitor *monitor)
         }
     }
 
-    r = add_notification(monitor, correct_class("IOUSBHostDevice", kIOUSBDeviceClassName),
+    r = add_notification(monitor, hs_version() >= 150000 ? "IOUSBHostDevice" : kIOUSBDeviceClassName,
                          kIOTerminatedNotification, darwin_devices_detached, &it);
     if (r < 0)
         goto error;
@@ -7002,6 +7030,14 @@ static int fill_device_details(struct udev_aggregate *agg, hs_device *dev)
     if (!buf)
         return 0;
     dev->pid = (uint16_t)strtoul(buf, NULL, 16);
+    if (errno)
+        return 0;
+
+    errno = 0;
+    buf = udev_device_get_sysattr_value(agg->usb, "bcdDevice");
+    if (!buf)
+        return 0;
+    dev->bcd_device = (uint16_t)strtoul(buf, NULL, 16);
     if (errno)
         return 0;
 
