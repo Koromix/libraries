@@ -1,1 +1,1 @@
-More information on [http://neodd.com/libraries](http://neodd.com/libraries).
+More information on [https://koromix.dev](https://koromix.dev).
