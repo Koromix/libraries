@@ -1613,9 +1613,7 @@ struct hs_port {
             uint8_t *read_ptr;
             size_t read_len;
             int read_status;
-            unsigned long read_pending_thread; // DWORD
 
-            void *write_handle; // HANDLE
             void *write_event; // HANDLE
         } handle;
 #else
@@ -2384,11 +2382,6 @@ int hs_adjust_timeout(int timeout, uint64_t start)
 // #include "device_priv.h"
 // #include "platform.h"
 
-typedef BOOL WINAPI CancelIoEx_func(HANDLE hFile, LPOVERLAPPED lpOverlapped);
-
-static BOOL WINAPI CancelIoEx_resolve(HANDLE hFile, LPOVERLAPPED lpOverlapped);
-static CancelIoEx_func *CancelIoEx_ = CancelIoEx_resolve;
-
 #define READ_BUFFER_SIZE 16384
 
 int _hs_open_file_port(hs_device *dev, hs_port_mode mode, hs_port **rport)
@@ -2532,23 +2525,6 @@ int _hs_open_file_port(hs_device *dev, hs_port_mode mode, hs_port **rport)
             r = hs_error(HS_ERROR_SYSTEM, "CreateEvent() failed: %s", hs_win32_strerror(0));
             goto error;
         }
-
-        /* We need to cancel IO for writes without interfering with pending read requests,
-           we can use CancelIoEx() on Vista or CancelIo() on a duplicate handle on XP. */
-        if ((mode & HS_PORT_MODE_READ) && hs_win32_version() < HS_WIN32_VERSION_VISTA) {
-            BOOL success;
-
-            hs_log(HS_LOG_DEBUG, "Using duplicate handle to write to '%s'", dev->path);
-            success = DuplicateHandle(GetCurrentProcess(), port->u.handle.h, GetCurrentProcess(),
-                                      &port->u.handle.write_handle, 0, TRUE, DUPLICATE_SAME_ACCESS);
-            if (!success) {
-                r = hs_error(HS_ERROR_SYSTEM, "DuplicateHandle() failed: %s", hs_win32_strerror(0));
-                port->u.handle.write_handle = NULL;
-                goto error;
-            }
-        } else {
-            port->u.handle.write_handle = port->u.handle.h;
-        }
     }
 
     *rport = port;
@@ -2559,72 +2535,24 @@ error:
     return r;
 }
 
-static unsigned int __stdcall overlapped_cleanup_thread(void *udata)
-{
-    hs_port *port = (hs_port *)udata;
-    DWORD ret;
-
-    /* Give up if nothing happens, even if it means a leak; we'll get rid of this when XP
-       becomes irrelevant anyway. Hope this happens within my lifetime. */
-    ret = WaitForSingleObject(port->u.handle.read_ov->hEvent, 120000);
-    if (ret != WAIT_OBJECT_0) {
-        hs_log(HS_LOG_WARNING, "Cannot stop asynchronous read request, leaking handle");
-        return 0;
-    }
-
-    port->u.handle.read_pending_thread = 0;
-    _hs_close_file_port(port);
-
-    return 0;
-}
-
-static BOOL WINAPI CancelIoEx_resolve(HANDLE hFile, LPOVERLAPPED lpOverlapped)
-{
-    CancelIoEx_ = (CancelIoEx_func *)GetProcAddress(LoadLibrary("kernel32.dll"), "CancelIoEx");
-    return CancelIoEx_(hFile, lpOverlapped);
-}
-
 void _hs_close_file_port(hs_port *port)
 {
     if (port) {
         hs_device_unref(port->dev);
         port->dev = NULL;
 
-        if (port->u.handle.read_pending_thread) {
-            if (hs_win32_version() >= HS_WIN32_VERSION_VISTA) {
-                CancelIoEx_(port->u.handle.h, NULL);
-                WaitForSingleObject(port->u.handle.read_ov->hEvent, INFINITE);
-            } else if (port->u.handle.read_pending_thread == GetCurrentThreadId()) {
-                CancelIo(port->u.handle.h);
-                WaitForSingleObject(port->u.handle.read_ov->hEvent, INFINITE);
-            } else {
-                CloseHandle(port->u.handle.h);
-                port->u.handle.h = NULL;
-
-                /* CancelIoEx does not exist on XP, so instead we create a new thread to
-                   cleanup when pending I/O stops. And if the thread cannot be created or
-                   the kernel does not set port->ov->hEvent, just leaking seems better than a
-                   potential segmentation fault. */
-                HANDLE thread = (HANDLE)_beginthreadex(NULL, 0, overlapped_cleanup_thread, port, 0, NULL);
-                if (thread) {
-                    hs_log(HS_LOG_WARNING, "Cannot stop asynchronous read request, leaking handle");
-                    CloseHandle(thread);
-                }
-                return;
-            }
-        }
-
-        if (port->u.handle.write_handle && port->u.handle.write_handle != port->u.handle.h)
-            CloseHandle(port->u.handle.write_handle);
+        if (CancelIoEx(port->u.handle.h, NULL))
+            WaitForSingleObject(port->u.handle.read_ov->hEvent, INFINITE);
         if (port->u.handle.h)
             CloseHandle(port->u.handle.h);
 
-        if (port->u.handle.write_event)
-            CloseHandle(port->u.handle.write_event);
         free(port->u.handle.read_buf);
         if (port->u.handle.read_ov && port->u.handle.read_ov->hEvent)
             CloseHandle(port->u.handle.read_ov->hEvent);
         free(port->u.handle.read_ov);
+
+        if (port->u.handle.write_event)
+            CloseHandle(port->u.handle.write_event);
     }
 
     free(port);
@@ -2650,7 +2578,6 @@ void _hs_win32_start_async_read(hs_port *port)
         return;
     }
 
-    port->u.handle.read_pending_thread = GetCurrentThreadId();
     port->u.handle.read_status = 0;
 }
 
@@ -2670,16 +2597,14 @@ void _hs_win32_finalize_async_read(hs_port *port, int timeout)
             return;
         }
 
-        port->u.handle.read_pending_thread = 0;
         port->u.handle.read_status = hs_error(HS_ERROR_IO, "I/O error while reading from '%s'",
-                                           port->path);
+                                              port->path);
         return;
     }
 
     port->u.handle.read_len = (size_t)len;
     port->u.handle.read_ptr = port->u.handle.read_buf;
 
-    port->u.handle.read_pending_thread = 0;
     port->u.handle.read_status = 1;
 }
 
@@ -2690,23 +2615,19 @@ ssize_t _hs_win32_write_sync(hs_port *port, const uint8_t *buf, size_t size, int
     BOOL success;
 
     ov.hEvent = port->u.handle.write_event;
-    success = WriteFile(port->u.handle.write_handle, buf, (DWORD)size, NULL, &ov);
+    success = WriteFile(port->u.handle.h, buf, (DWORD)size, NULL, &ov);
     if (!success && GetLastError() != ERROR_IO_PENDING)
         return hs_error(HS_ERROR_IO, "I/O error while writing to '%s'", port->path);
 
     if (timeout > 0)
         WaitForSingleObject(ov.hEvent, (DWORD)timeout);
 
-    success = GetOverlappedResult(port->u.handle.write_handle, &ov, &len, timeout < 0);
+    success = GetOverlappedResult(port->u.handle.h, &ov, &len, timeout < 0);
     if (!success) {
         if (GetLastError() == ERROR_IO_INCOMPLETE) {
-            if (port->u.handle.write_handle != port->u.handle.h) {
-                CancelIo(port->u.handle.write_handle);
-            } else {
-                CancelIoEx_(port->u.handle.write_handle, &ov);
-            }
+            CancelIoEx(port->u.handle.h, &ov);
 
-            success = GetOverlappedResult(port->u.handle.write_handle, &ov, &len, TRUE);
+            success = GetOverlappedResult(port->u.handle.h, &ov, &len, TRUE);
             if (!success)
                 len = 0;
         } else {
@@ -2929,7 +2850,7 @@ static CRITICAL_SECTION controllers_lock;
 static char *controllers[32];
 static unsigned int controllers_count;
 
-static bool get_device_cursor(DEVINST inst, struct device_cursor *new_cursor)
+static bool make_device_cursor(DEVINST inst, struct device_cursor *new_cursor)
 {
     CONFIGRET cret;
 
@@ -2943,9 +2864,9 @@ static bool get_device_cursor(DEVINST inst, struct device_cursor *new_cursor)
     return true;
 }
 
-static bool get_device_cursor_relative(struct device_cursor *cursor,
-                                       enum device_cursor_relative relative,
-                                       struct device_cursor *new_cursor)
+static bool make_relative_cursor(struct device_cursor *cursor,
+                                 enum device_cursor_relative relative,
+                                 struct device_cursor *new_cursor)
 {
     DEVINST new_inst;
     CONFIGRET cret = 0xFFFFFFFF;
@@ -2977,12 +2898,7 @@ static bool get_device_cursor_relative(struct device_cursor *cursor,
     }
     assert(cret != 0xFFFFFFFF);
 
-    return get_device_cursor(new_inst, new_cursor);
-}
-
-static bool move_device_cursor(struct device_cursor *cursor, enum device_cursor_relative relative)
-{
-    return get_device_cursor_relative(cursor, relative, cursor);
+    return make_device_cursor(new_inst, new_cursor);
 }
 
 static uint8_t find_controller(const char *id)
@@ -3183,7 +3099,7 @@ static int find_device_port_ioctl(const char *hub_id, const char *child_key)
         goto cleanup;
     }
 
-    hs_log(HS_LOG_DEBUG, "Asking HUB at '%s' for port information (XP code path)", path);
+    hs_log(HS_LOG_DEBUG, "Asking HUB at '%s' for port information (legacy code path)", path);
     success = DeviceIoControl(h, IOCTL_USB_GET_NODE_INFORMATION, NULL, 0, &node, sizeof(node),
                               &len, NULL);
     if (!success) {
@@ -3245,9 +3161,8 @@ static int resolve_usb_location_ioctl(struct device_cursor usb_cursor, uint8_t p
         CONFIGRET cret;
         int r;
 
-        if (!get_device_cursor_relative(&usb_cursor, DEVINST_RELATIVE_PARENT, &parent_cursor)) {
+        if (!make_relative_cursor(&usb_cursor, DEVINST_RELATIVE_PARENT, &parent_cursor))
             return 0;
-        }
 
         child_key_len = sizeof(child_key);
         cret = CM_Get_DevNode_Registry_Property(usb_cursor.inst, CM_DRP_DRIVER, NULL,
@@ -3309,32 +3224,25 @@ static int resolve_usb_location_cfgmgr(struct device_cursor usb_cursor, uint8_t 
             return 0;
         }
 
-        if (!move_device_cursor(&usb_cursor, DEVINST_RELATIVE_PARENT)) {
+        if (!make_relative_cursor(&usb_cursor, DEVINST_RELATIVE_PARENT, &usb_cursor))
             return 0;
-        }
     } while (!is_root_usb_controller(usb_cursor.id));
 
     *roothub_cursor = usb_cursor;
     return (int)depth;
 }
 
-static int find_device_location(DEVINST inst, uint8_t ports[])
+static int find_device_location(const struct device_cursor *dev_cursor, uint8_t ports[])
 {
-    struct device_cursor dev_cursor;
     struct device_cursor usb_cursor;
     struct device_cursor roothub_cursor;
     int depth;
 
-    if (!get_device_cursor(inst, &dev_cursor)) {
-        return 0;
-    }
-
     // Find the USB device instance
-    usb_cursor = dev_cursor;
+    usb_cursor = *dev_cursor;
     while (strncmp(usb_cursor.id, "USB\\", 4) != 0 || strstr(usb_cursor.id, "&MI_")) {
-        if (!move_device_cursor(&usb_cursor, DEVINST_RELATIVE_PARENT)) {
+        if (!make_relative_cursor(&usb_cursor, DEVINST_RELATIVE_PARENT, &usb_cursor))
             return 0;
-        }
     }
 
     /* Browse the USB tree to resolve USB ports. Try the CfgMgr method first, only
@@ -3347,13 +3255,13 @@ static int find_device_location(DEVINST inst, uint8_t ports[])
             return depth;
     }
     if (!depth) {
-        hs_log(HS_LOG_DEBUG, "Using legacy XP code for location of '%s'", dev_cursor.id);
+        hs_log(HS_LOG_DEBUG, "Using legacy code for location of '%s'", dev_cursor->id);
         depth = resolve_usb_location_ioctl(usb_cursor, ports, &roothub_cursor);
         if (depth < 0)
             return depth;
     }
     if (!depth) {
-        hs_log(HS_LOG_DEBUG, "Cannot resolve USB location for '%s'", dev_cursor.id);
+        hs_log(HS_LOG_DEBUG, "Cannot resolve USB location for '%s'", dev_cursor->id);
         return 0;
     }
 
@@ -3492,43 +3400,51 @@ static int get_string_descriptor(HANDLE hub, uint8_t port, uint8_t index, char *
     return 0;
 }
 
-static int read_device_properties(hs_device *dev, DEVINST inst, uint8_t port)
+static int read_device_properties(hs_device *dev, const struct device_cursor *dev_cursor, uint8_t port)
 {
-    char buf[256];
+    struct device_cursor intf_cursor, usb_cursor, hub_cursor;
     unsigned int vid, pid, iface_number;
     char *path = NULL;
     HANDLE hub = NULL;
     DWORD len;
     USB_NODE_CONNECTION_INFORMATION_EX *node = NULL;
-    CONFIGRET cret;
     BOOL success;
     int r;
 
-    // Get the device handle corresponding to the USB device or interface
-    do {
-        cret = CM_Get_Device_ID(inst, buf, sizeof(buf), 0);
-        if (cret != CR_SUCCESS) {
-            hs_log(HS_LOG_WARNING, "CM_Get_Device_ID() failed: 0x%lx", cret);
-            return 0;
+    // Find relevant device instances: interface, device, HUB
+    intf_cursor = *dev_cursor;
+    while (strncmp(intf_cursor.id, "USB\\", 4) != 0) {
+        if (!make_relative_cursor(&intf_cursor, DEVINST_RELATIVE_PARENT, &intf_cursor)) {
+            r = 0;
+            goto cleanup;
         }
-
-        if (strncmp(buf, "USB\\", 4) == 0)
-            break;
-
-        cret = CM_Get_Parent(&inst, inst, 0);
-    } while (cret == CR_SUCCESS);
-    if (cret != CR_SUCCESS) {
-        hs_log(HS_LOG_WARNING, "CM_Get_Parent() failed: 0x%lx", cret);
+    }
+    if (strstr(intf_cursor.id, "&MI_")) {
+        if (!make_relative_cursor(&intf_cursor, DEVINST_RELATIVE_PARENT, &usb_cursor)) {
+            r = 0;
+            goto cleanup;
+        }
+    } else {
+        usb_cursor = intf_cursor;
+    }
+    if (!make_relative_cursor(&usb_cursor, DEVINST_RELATIVE_PARENT, &hub_cursor)) {
         r = 0;
+        goto cleanup;
+    }
+
+    // Make device key (used for removal, among other things)
+    dev->key = strdup(usb_cursor.id);
+    if (!dev->key) {
+        r = hs_error(HS_ERROR_MEMORY, NULL);
         goto cleanup;
     }
 
     /* h and hh type modifier characters are not known to msvcrt, and MinGW issues warnings
        if we try to use them. Use temporary unsigned int variables to get around that. */
     iface_number = 0;
-    r = sscanf(buf, "USB\\VID_%04x&PID_%04x&MI_%02u", &vid, &pid, &iface_number);
+    r = sscanf(intf_cursor.id, "USB\\VID_%04x&PID_%04x&MI_%02u", &vid, &pid, &iface_number);
     if (r < 2) {
-        hs_log(HS_LOG_WARNING, "Failed to parse USB properties from '%s'", buf);
+        hs_log(HS_LOG_WARNING, "Failed to parse USB properties from '%s'", intf_cursor.id);
         r = 0;
         goto cleanup;
     }
@@ -3536,36 +3452,14 @@ static int read_device_properties(hs_device *dev, DEVINST inst, uint8_t port)
     dev->pid = (uint16_t)pid;
     dev->iface_number = (uint8_t)iface_number;
 
-    // Now we need the device handle for the USB hub where the device is plugged
-    if (r == 3) {
-        cret = CM_Get_Parent(&inst, inst, 0);
-        if (cret != CR_SUCCESS) {
-            hs_log(HS_LOG_WARNING, "CM_Get_Parent() failed: 0x%lx", cret);
-            r = 0;
-            goto cleanup;
-        }
-    }
-    cret = CM_Get_Parent(&inst, inst, 0);
-    if (cret != CR_SUCCESS) {
-        hs_log(HS_LOG_WARNING, "CM_Get_Parent() failed: 0x%lx", cret);
-        r = 0;
-        goto cleanup;
-    }
-    cret = CM_Get_Device_ID(inst, buf, sizeof(buf), 0);
-    if (cret != CR_SUCCESS) {
-        hs_log(HS_LOG_WARNING, "CM_Get_Device_ID() failed: 0x%lx", cret);
-        r = 0;
-        goto cleanup;
-    }
-
-    r = build_device_path(buf, &GUID_DEVINTERFACE_USB_HUB, &path);
+    r = build_device_path(hub_cursor.id, &GUID_DEVINTERFACE_USB_HUB, &path);
     if (r < 0)
         goto cleanup;
 
     hub = CreateFile(path, GENERIC_WRITE, FILE_SHARE_WRITE | FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
     if (hub == INVALID_HANDLE_VALUE) {
         hs_log(HS_LOG_DEBUG, "Cannot open parent hub device at '%s', ignoring device properties for '%s'",
-               path, dev->key);
+               path, dev_cursor->id);
         r = 1;
         goto cleanup;
     }
@@ -3581,8 +3475,8 @@ static int read_device_properties(hs_device *dev, DEVINST inst, uint8_t port)
     success = DeviceIoControl(hub, IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX, node, len,
                               node, len, &len, NULL);
     if (!success) {
-        hs_log(HS_LOG_DEBUG, "Failed to interrogate hub device at '%s' for device '%s'", path,
-               dev->key);
+        hs_log(HS_LOG_DEBUG, "Failed to interrogate hub device at '%s' for device '%s'",
+               path, dev_cursor->id);
         r = 1;
         goto cleanup;
     }
@@ -3660,47 +3554,53 @@ static int get_device_comport(DEVINST inst, char **rnode)
     return 1;
 }
 
-static int find_device_node(DEVINST inst, hs_device *dev)
+static int find_device_node(hs_device *dev, const struct device_cursor *dev_cursor)
 {
     int r;
 
     /* GUID_DEVINTERFACE_COMPORT only works for real COM ports... Haven't found any way to
        list virtual (USB) serial device interfaces, so instead list USB devices and consider
        them serial if registry key "PortName" is available (and use its value as device node). */
-    if (strncmp(dev->key, "USB\\", 4) == 0 || strncmp(dev->key, "FTDIBUS\\", 8) == 0) {
-        r = get_device_comport(inst, &dev->path);
+    if (strncmp(dev_cursor->id, "USB\\", 4) == 0 || strncmp(dev_cursor->id, "FTDIBUS\\", 8) == 0) {
+        r = get_device_comport(dev_cursor->inst, &dev->path);
         if (!r) {
-            hs_log(HS_LOG_DEBUG, "Device '%s' has no 'PortName' registry property", dev->key);
+            hs_log(HS_LOG_DEBUG, "Device '%s' has no 'PortName' registry property", dev_cursor->id);
             return r;
         }
         if (r < 0)
             return r;
 
         dev->type = HS_DEVICE_TYPE_SERIAL;
-    } else if (strncmp(dev->key, "HID\\", 4) == 0) {
+    } else if (strncmp(dev_cursor->id, "HID\\", 4) == 0) {
         static GUID hid_interface_guid;
         if (!hid_interface_guid.Data1)
             HidD_GetHidGuid(&hid_interface_guid);
 
-        r = build_device_path(dev->key, &hid_interface_guid, &dev->path);
+        r = build_device_path(dev_cursor->id, &hid_interface_guid, &dev->path);
         if (r < 0)
             return r;
 
         dev->type = HS_DEVICE_TYPE_HID;
     } else {
-        hs_log(HS_LOG_DEBUG, "Unknown device type for '%s'", dev->key);
+        hs_log(HS_LOG_DEBUG, "Unknown device type for '%s'", dev_cursor->id);
         return 0;
     }
 
     return 1;
 }
 
-static int process_win32_device(DEVINST inst, const char *id, hs_device **rdev)
+static int process_win32_device(DEVINST inst, hs_device **rdev)
 {
+    struct device_cursor dev_cursor;
     hs_device *dev;
     uint8_t ports[MAX_USB_DEPTH];
     unsigned int depth;
     int r;
+
+    if (!make_device_cursor(inst, &dev_cursor)) {
+        r = 0;
+        goto cleanup;
+    }
 
     dev = (hs_device *)calloc(1, sizeof(*dev));
     if (!dev) {
@@ -3710,48 +3610,28 @@ static int process_win32_device(DEVINST inst, const char *id, hs_device **rdev)
     dev->refcount = 1;
     dev->status = HS_DEVICE_STATUS_ONLINE;
 
-    if (id) {
-        dev->key = strdup(id);
-    } else {
-        char buf[256];
-        CONFIGRET cret;
-
-        cret = CM_Get_Device_ID(inst, buf, sizeof(buf), 0);
-        if (cret != CR_SUCCESS) {
-            hs_log(HS_LOG_WARNING, "CM_Get_Device_ID() failed: 0x%lx", cret);
-            r = 0;
-            goto cleanup;
-        }
-
-        dev->key = strdup(buf);
-    }
-    if (!dev->key) {
-        r = hs_error(HS_ERROR_MEMORY, NULL);
-        goto cleanup;
-    }
-
     // HID devices can have multiple collections for each interface, ignore them
-    if (strncmp(dev->key, "HID\\", 4) == 0) {
-        const char *ptr = strstr(dev->key, "&COL");
+    if (strncmp(dev_cursor.id, "HID\\", 4) == 0) {
+        const char *ptr = strstr(dev_cursor.id, "&COL");
         if (ptr && strncmp(ptr, "&COL01\\",  7) != 0) {
-            hs_log(HS_LOG_DEBUG, "Ignoring duplicate HID collection device '%s'", dev->key);
+            hs_log(HS_LOG_DEBUG, "Ignoring duplicate HID collection device '%s'", dev_cursor.id);
             r = 0;
             goto cleanup;
         }
     }
 
-    hs_log(HS_LOG_DEBUG, "Examining device node '%s'", dev->key);
+    hs_log(HS_LOG_DEBUG, "Examining device node '%s'", dev_cursor.id);
 
-    r = find_device_node(inst, dev);
+    r = find_device_node(dev, &dev_cursor);
     if (r <= 0)
         goto cleanup;
 
-    r = find_device_location(inst, ports);
+    r = find_device_location(&dev_cursor, ports);
     if (r <= 0)
         goto cleanup;
     depth = (unsigned int)r;
 
-    r = read_device_properties(dev, inst, ports[depth - 1]);
+    r = read_device_properties(dev, &dev_cursor, ports[depth - 1]);
     if (r <= 0)
         goto cleanup;
 
@@ -3813,36 +3693,28 @@ static int populate_controllers(void)
 
     info.cbSize = sizeof(info);
     for (DWORD i = 0; SetupDiEnumDeviceInfo(set, i, &info); i++) {
-        DEVINST roothub_inst;
-        char roothub_id[256];
-        CONFIGRET cret;
+        struct device_cursor cursor;
 
         if (controllers_count == _HS_COUNTOF(controllers)) {
             hs_log(HS_LOG_WARNING, "Reached maximum controller ID %d, ignoring", UINT8_MAX);
             break;
         }
 
-        cret = CM_Get_Child(&roothub_inst, info.DevInst, 0);
-        if (cret != CR_SUCCESS) {
-            hs_log(HS_LOG_WARNING, "Found USB Host controller without a root hub");
+        if (!make_device_cursor(info.DevInst, &cursor))
             continue;
-        }
-        cret = CM_Get_Device_ID(roothub_inst, roothub_id, sizeof(roothub_id), 0);
-        if (cret != CR_SUCCESS) {
-            hs_log(HS_LOG_WARNING, "CM_Get_Device_ID() failed: 0x%lx", cret);
+        if (!make_relative_cursor(&cursor, DEVINST_RELATIVE_CHILD, &cursor))
             continue;
-        }
-        if (!is_root_usb_controller(roothub_id)) {
-            hs_log(HS_LOG_WARNING, "Expected root hub device at '%s'", roothub_id);
+        if (!is_root_usb_controller(cursor.id)) {
+            hs_log(HS_LOG_WARNING, "Expected root hub device at '%s'", cursor.id);
             continue;
         }
 
-        controllers[controllers_count] = strdup(roothub_id);
+        controllers[controllers_count] = strdup(cursor.id);
         if (!controllers[controllers_count]) {
             r = hs_error(HS_ERROR_MEMORY, NULL);
             goto cleanup;
         }
-        hs_log(HS_LOG_DEBUG, "Found root USB hub '%s' with ID %u", roothub_id, controllers_count);
+        hs_log(HS_LOG_DEBUG, "Found root USB hub '%s' with ID %u", cursor.id, controllers_count);
         controllers_count++;
     }
 
@@ -3870,7 +3742,7 @@ static int enumerate_setup_class(const GUID *guid, const _hs_match_helper *match
 
     info.cbSize = sizeof(info);
     for (DWORD i = 0; SetupDiEnumDeviceInfo(set, i, &info); i++) {
-        r = process_win32_device(info.DevInst, NULL, &dev);
+        r = process_win32_device(info.DevInst, &dev);
         if (r < 0)
             goto cleanup;
         if (!r)
@@ -3958,24 +3830,17 @@ int hs_enumerate(const hs_match_spec *matches, unsigned int count, hs_enumerate_
     return r;
 }
 
-static int post_event(hs_monitor *monitor, enum event_type event_type,
-                      DEV_BROADCAST_DEVICEINTERFACE *msg)
+static int post_event(hs_monitor *monitor, enum event_type event_type, const char *id)
 {
-    const char *id;
     size_t id_len;
     struct event *event;
-    UINT_PTR timer;
     int r;
-
-    if (msg->dbcc_devicetype != DBT_DEVTYP_DEVICEINTERFACE)
-        return 0;
 
     /* Extract the device instance ID part.
        - in: \\?\USB#Vid_2341&Pid_0042#85336303532351101252#{a5dcbf10-6530-11d2-901f-00c04fb951ed}
        - out: USB#Vid_2341&Pid_0042#85336303532351101252
        You may notice that paths from RegisterDeviceNotification() seem to start with '\\?\',
        which according to MSDN is the file namespace, not the device namespace '\\.\'. Oh well. */
-    id = msg->dbcc_name;
     if (strncmp(id, "\\\\?\\", 4) == 0
             || strncmp(id, "\\\\.\\", 4) == 0
             || strncmp(id, "##.#", 4) == 0
@@ -4008,9 +3873,30 @@ static int post_event(hs_monitor *monitor, enum event_type event_type,
         }
     }
 
-    timer = SetTimer(monitor->thread_hwnd, 1, 100, NULL);
-    if (!timer)
-        return hs_error(HS_ERROR_SYSTEM, "SetTimer() failed: %s", hs_win32_strerror(0));
+    /* On Windows 7 (and maybe Windows 8), we don't get notifications for individual
+       interfaces in composite devices. We need to search for them. */
+    if (event_type == DEVICE_EVENT_ADDED && hs_win32_version() < HS_WIN32_VERSION_10) {
+        DEVINST inst;
+        CONFIGRET cret;
+
+        cret = CM_Locate_DevNode(&inst, (DEVINSTID)event->device_key, CM_LOCATE_DEVNODE_NORMAL);
+        if (cret != CR_SUCCESS) {
+            hs_log(HS_LOG_DEBUG, "Device node '%s' does not exist: 0x%lx", event->device_key, cret);
+            return 0;
+        }
+
+        struct device_cursor child_cursor;
+        if (!make_device_cursor(inst, &child_cursor))
+            return 0;
+        if (!make_relative_cursor(&child_cursor, DEVINST_RELATIVE_CHILD, &child_cursor))
+            return 0;
+
+        do {
+            r = post_event(monitor, DEVICE_EVENT_ADDED, child_cursor.id);
+            if (r < 0)
+                return r;
+        } while (make_relative_cursor(&child_cursor, DEVINST_RELATIVE_SIBLING, &child_cursor));
+    }
 
     return 0;
 }
@@ -4022,18 +3908,30 @@ static LRESULT __stdcall window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM 
 
     switch (msg) {
         case WM_DEVICECHANGE: {
+            DEV_BROADCAST_DEVICEINTERFACE *msg = (DEV_BROADCAST_DEVICEINTERFACE *)lparam;
+
+            if (msg->dbcc_devicetype != DBT_DEVTYP_DEVICEINTERFACE)
+                break;
+
             r = 0;
             switch (wparam) {
                 case DBT_DEVICEARRIVAL: {
-                    r = post_event(monitor, DEVICE_EVENT_ADDED,
-                                          (DEV_BROADCAST_DEVICEINTERFACE *)lparam);
+                    r = post_event(monitor, DEVICE_EVENT_ADDED, msg->dbcc_name);
                 } break;
 
                 case DBT_DEVICEREMOVECOMPLETE: {
-                    r = post_event(monitor, DEVICE_EVENT_REMOVED,
-                                          (DEV_BROADCAST_DEVICEINTERFACE *)lparam);
+                    r = post_event(monitor, DEVICE_EVENT_REMOVED, msg->dbcc_name);
                 } break;
             }
+
+            if (!r) {
+                UINT_PTR timer;
+
+                timer = SetTimer(monitor->thread_hwnd, 1, 100, NULL);
+                if (!timer)
+                    r = hs_error(HS_ERROR_SYSTEM, "SetTimer() failed: %s", hs_win32_strerror(0));
+            }
+
             if (r < 0) {
                 EnterCriticalSection(&monitor->events_lock);
                 monitor->thread_ret = r;
@@ -4291,7 +4189,7 @@ static int process_arrival_event(hs_monitor *monitor, const char *key, hs_enumer
         return 0;
     }
 
-    r = process_win32_device(inst, key, &dev);
+    r = process_win32_device(inst, &dev);
     if (r <= 0)
         return r;
 
