@@ -38,16 +38,17 @@
 #include <sys/types.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdarg.h>
 
 #ifdef __cplusplus
-    #define HS_BEGIN_C extern "C" {
-    #define HS_END_C }
+    #define _HS_BEGIN_C extern "C" {
+    #define _HS_END_C }
 #else
-    #define HS_BEGIN_C
-    #define HS_END_C
+    #define _HS_BEGIN_C
+    #define _HS_END_C
 #endif
 
-HS_BEGIN_C
+_HS_BEGIN_C
 
 typedef struct hs_device hs_device;
 typedef struct hs_monitor hs_monitor;
@@ -80,13 +81,21 @@ typedef struct hs_match_spec hs_match_spec;
 #define HS_VERSION_STRING "0.9.0"
 
 #if defined(__GNUC__)
+    #define _HS_POSSIBLY_UNUSED __attribute__((__unused__))
+    #define _HS_THREAD_LOCAL __thread
+    #define _HS_ALIGN_OF(type)  __alignof__(type)
+
     #ifdef __MINGW_PRINTF_FORMAT
-        #define HS_PRINTF_FORMAT(fmt, first) __attribute__((__format__(__MINGW_PRINTF_FORMAT, fmt, first)))
+        #define _HS_PRINTF_FORMAT(fmt, first) __attribute__((__format__(__MINGW_PRINTF_FORMAT, fmt, first)))
     #else
-        #define HS_PRINTF_FORMAT(fmt, first) __attribute__((__format__(__printf__, fmt, first)))
+        #define _HS_PRINTF_FORMAT(fmt, first) __attribute__((__format__(__printf__, fmt, first)))
     #endif
 #elif _MSC_VER >= 1900
-    #define HS_PRINTF_FORMAT(fmt, first)
+    #define _HS_POSSIBLY_UNUSED
+    #define _HS_THREAD_LOCAL __declspec(thread)
+    #define _HS_ALIGN_OF(type) __alignof(type)
+
+    #define _HS_PRINTF_FORMAT(fmt, first)
 
     // HAVE_SSIZE_T is used this way by other projects
     #ifndef HAVE_SSIZE_T
@@ -97,17 +106,27 @@ typedef __int64 ssize_t;
 typedef long ssize_t;
         #endif
     #endif
+
+    #define strcasecmp _stricmp
+    #define strncasecmp _strnicmp
 #else
     #error "This compiler is not supported"
 #endif
 
 #define _HS_CONCAT_HELPER(a, b) a ## b
 #define _HS_CONCAT(a, b) _HS_CONCAT_HELPER(a, b)
-
 #define _HS_UNIQUE_ID(prefix) _HS_CONCAT(prefix, __LINE__)
-
-#define _hs_container_of(head, type, member) \
+#define _HS_UNUSED(arg) ((void)(arg))
+#define _HS_COUNTOF(a) (sizeof(a) / sizeof(*(a)))
+#define _HS_MIN(a,b) ((a) < (b) ? (a) : (b))
+#define _HS_MAX(a,b) ((a) > (b) ? (a) : (b))
+#define _HS_ALIGN_SIZE(size, align) (((size) + (align) - 1) / (align) * (align))
+#define _HS_ALIGN_SIZE_FOR_TYPE(size, type) _HS_ALIGN_SIZE((size), sizeof(type))
+#define _HS_CONTAINER_OF(head, type, member) \
     ((type *)((char *)(head) - (size_t)(&((type *)0)->member)))
+
+int _hs_asprintf(char **strp, const char *fmt, ...) _HS_PRINTF_FORMAT(2, 3);
+int _hs_vasprintf(char **strp, const char *fmt, va_list ap);
 
 #if defined(DOXYGEN)
 /**
@@ -231,7 +250,7 @@ void hs_log_set_handler(hs_log_handler_func *f, void *udata);
  *
  * @sa hs_log_set_handler() to use a custom callback function.
  */
-void hs_log(hs_log_level level, const char *fmt, ...) HS_PRINTF_FORMAT(2, 3);
+void hs_log(hs_log_level level, const char *fmt, ...) _HS_PRINTF_FORMAT(2, 3);
 
 /** @} */
 
@@ -322,9 +341,9 @@ const char *hs_error_last_message();
  * @sa hs_error_mask() to mask specific error codes.
  * @sa hs_log_set_handler() to use a custom callback function.
  */
-int hs_error(hs_error_code err, const char *fmt, ...) HS_PRINTF_FORMAT(2, 3);
+int hs_error(hs_error_code err, const char *fmt, ...) _HS_PRINTF_FORMAT(2, 3);
 
-HS_END_C
+_HS_END_C
 
 #endif
 
@@ -336,7 +355,7 @@ HS_END_C
 
 // #include "common.h"
 
-HS_BEGIN_C
+_HS_BEGIN_C
 
 struct _hs_array {
     void *values;
@@ -402,7 +421,7 @@ static inline int _hs_array_grow_(struct _hs_array *array, size_t value_size, si
 
 void _hs_array_shrink_(struct _hs_array *array, size_t value_size);
 
-HS_END_C
+_HS_END_C
 
 #endif
 
@@ -414,7 +433,7 @@ HS_END_C
 
 // #include "common.h"
 
-HS_BEGIN_C
+_HS_BEGIN_C
 
 typedef struct _hs_htable_head {
     // Keep first!
@@ -466,7 +485,7 @@ static inline uint32_t _hs_htable_hash_ptr(const void *p)
              cur != _HS_UNIQUE_ID(head); cur = _HS_UNIQUE_ID(next), _HS_UNIQUE_ID(next) = cur->next) \
             if (cur->key == (k))
 
-HS_END_C
+_HS_END_C
 
 #endif
 
@@ -479,7 +498,7 @@ HS_END_C
 // #include "common.h"
 // #include "htable.h"
 
-HS_BEGIN_C
+_HS_BEGIN_C
 
 /**
  * @defgroup device Device handling
@@ -707,7 +726,7 @@ hs_device *hs_port_get_device(const hs_port *port);
  */
 hs_handle hs_port_get_poll_handle(const hs_port *port);
 
-HS_END_C
+_HS_END_C
 
 #endif
 
@@ -719,7 +738,7 @@ HS_END_C
 
 // #include "common.h"
 
-HS_BEGIN_C
+_HS_BEGIN_C
 
 /**
  * @defgroup hid HID device I/O
@@ -791,7 +810,7 @@ ssize_t hs_hid_get_feature_report(hs_port *port, uint8_t report_id, uint8_t *buf
  */
 ssize_t hs_hid_send_feature_report(hs_port *port, const uint8_t *buf, size_t size);
 
-HS_END_C
+_HS_END_C
 
 #endif
 
@@ -803,7 +822,7 @@ HS_END_C
 
 // #include "common.h"
 
-HS_BEGIN_C
+_HS_BEGIN_C
 
 /**
  * @defgroup match Device matching
@@ -873,7 +892,7 @@ struct hs_match_spec {
  */
 int hs_match_parse(const char *str, hs_match_spec *rspec);
 
-HS_END_C
+_HS_END_C
 
 #endif
 
@@ -885,7 +904,7 @@ HS_END_C
 
 // #include "common.h"
 
-HS_BEGIN_C
+_HS_BEGIN_C
 
 /**
  * @defgroup monitor Device discovery
@@ -1071,7 +1090,7 @@ int hs_monitor_refresh(hs_monitor *monitor, hs_enumerate_func *f, void *udata);
  */
 int hs_monitor_list(hs_monitor *monitor, hs_enumerate_func *f, void *udata);
 
-HS_END_C
+_HS_END_C
 
 #endif
 
@@ -1083,7 +1102,7 @@ HS_END_C
 
 // #include "common.h"
 
-HS_BEGIN_C
+_HS_BEGIN_C
 
 #ifdef _WIN32
 /**
@@ -1148,6 +1167,15 @@ typedef struct hs_poll_source {
  * @return This function returns a mononotic time value in milliseconds.
  */
 uint64_t hs_millis(void);
+
+/**
+ * @ingroup misc
+ * @brief Suspend execution of calling thread until specified time has passed.
+ *
+ * @param ms Wait time in milliseconds.
+ *
+ */
+void hs_delay(unsigned int ms);
 
 /**
  * @ingroup misc
@@ -1256,7 +1284,7 @@ uint32_t hs_darwin_version(void);
  */
 int hs_poll(hs_poll_source *sources, unsigned int count, int timeout);
 
-HS_END_C
+_HS_END_C
 
 #endif
 
@@ -1268,7 +1296,7 @@ HS_END_C
 
 // #include "common.h"
 
-HS_BEGIN_C
+_HS_BEGIN_C
 
 /**
  * @defgroup serial Serial device I/O
@@ -1496,7 +1524,7 @@ ssize_t hs_serial_read(hs_port *port, uint8_t *buf, size_t size, int timeout);
  */
 ssize_t hs_serial_write(hs_port *port, const uint8_t *buf, size_t size, int timeout);
 
-HS_END_C
+_HS_END_C
 
 #endif
 
@@ -1511,44 +1539,6 @@ HS_END_C
         #pragma comment(lib, "hid.lib")
     #endif
 
-// compat_priv.h
-// ------------------------------------
-
-#ifndef _HS_COMPAT_H
-#define _HS_COMPAT_H
-
-// #include "common_priv.h"
-#include <stdarg.h>
-
-#ifdef _HS_HAVE_CONFIG_H
-    // #include "config.h"
-#else
-    /* This file is used when building with qmake, otherwise CMake detects
-       these features. */
-    #if defined(_GNU_SOURCE) || _POSIX_C_SOURCE >= 200809L
-        #define _HS_HAVE_STPCPY
-    #endif
-    #ifdef _GNU_SOURCE
-        #define _HS_HAVE_ASPRINTF
-    #endif
-#endif
-
-#ifdef _HS_HAVE_STPCPY
-    #define _hs_stpcpy stpcpy
-#else
-char *_hs_stpcpy(char *dest, const char *src);
-#endif
-
-#ifdef _HS_HAVE_ASPRINTF
-    #define _hs_asprintf asprintf
-    #define _hs_vasprintf vasprintf
-#else
-int _hs_asprintf(char **strp, const char *fmt, ...) HS_PRINTF_FORMAT(2, 3);
-int _hs_vasprintf(char **strp, const char *fmt, va_list ap);
-#endif
-
-#endif
-
 // common_priv.h
 // ------------------------------------
 
@@ -1556,7 +1546,6 @@ int _hs_vasprintf(char **strp, const char *fmt, va_list ap);
 #define _HS_COMMON_PRIV_H
 
 // #include "common.h"
-// #include "compat_priv.h"
 #include <assert.h>
 #include <errno.h>
 #include <inttypes.h>
@@ -1564,26 +1553,6 @@ int _hs_vasprintf(char **strp, const char *fmt, va_list ap);
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#if defined(__GNUC__)
-    #define _HS_POSSIBLY_UNUSED __attribute__((__unused__))
-    #define _HS_THREAD_LOCAL __thread
-    #define _HS_ALIGN_OF(type)  __alignof__(type)
-#elif defined(_MSC_VER)
-    #define _HS_POSSIBLY_UNUSED
-    #define _HS_THREAD_LOCAL __declspec(thread)
-    #define _HS_ALIGN_OF(type) __alignof(type)
-
-    #define strcasecmp _stricmp
-    #define strncasecmp _strnicmp
-#endif
-
-#define _HS_UNUSED(arg) ((void)(arg))
-
-#define _HS_COUNTOF(a) (sizeof(a) / sizeof(*(a)))
-
-#define _HS_ALIGN_SIZE(size, align) (((size) + (align) - 1) / (align) * (align))
-#define _HS_ALIGN_SIZE_FOR_TYPE(size, type) _HS_ALIGN_SIZE((size), sizeof(type))
 
 #endif
 
@@ -1685,7 +1654,6 @@ bool _hs_match_helper_has_type(const _hs_match_helper *helper, hs_device_type ty
 // ------------------------------------
 
 // #include "common_priv.h"
-#include <stdarg.h>
 
 static hs_log_handler_func *log_handler = hs_log_default_handler;
 static void *log_handler_udata;
@@ -1812,28 +1780,17 @@ int hs_error(hs_error_code err, const char *fmt, ...)
     return err;
 }
 
-// compat.c
-// ------------------------------------
-
-// #include "common_priv.h"
-
-#ifndef _HS_HAVE_STPCPY
-char *_hs_stpcpy(char *dest, const char *src)
-{
-    while ((*dest++ = *src++))
-        continue;
-    return dest - 1;
-}
-#endif
-
-#ifndef _HS_HAVE_ASPRINTF
 int _hs_asprintf(char **strp, const char *fmt, ...)
 {
     va_list ap;
     int r;
 
     va_start(ap, fmt);
+#ifdef HAVE_ASPRINTF
+    r = vasprintf(strp, fmt, ap);
+#else
     r = _hs_vasprintf(strp, fmt, ap);
+#endif
     va_end(ap);
 
     return r;
@@ -1841,6 +1798,9 @@ int _hs_asprintf(char **strp, const char *fmt, ...)
 
 int _hs_vasprintf(char **strp, const char *fmt, va_list ap)
 {
+#ifdef HAVE_ASPRINTF
+    return vasprintf(strp, fmt, ap);
+#else
     va_list ap_copy;
     char *s;
     int r;
@@ -1863,8 +1823,8 @@ int _hs_vasprintf(char **strp, const char *fmt, va_list ap)
 
     *strp = s;
     return r;
-}
 #endif
+}
 
 // array.c
 // ------------------------------------
@@ -2011,22 +1971,12 @@ int hs_port_open(hs_device *dev, hs_port_mode mode, hs_port **rport)
     if (dev->status != HS_DEVICE_STATUS_ONLINE)
         return hs_error(HS_ERROR_NOT_FOUND, "Device '%s' is not connected", dev->path);
 
-    switch (dev->type) {
-        case HS_DEVICE_TYPE_HID: {
 #ifdef __APPLE__
-            return _hs_darwin_open_hid_port(dev, mode, rport);
-#else
-            return _hs_open_file_port(dev, mode, rport);
+    if (dev->type == HS_DEVICE_TYPE_HID)
+        return _hs_darwin_open_hid_port(dev, mode, rport);
 #endif
-        } break;
 
-        case HS_DEVICE_TYPE_SERIAL: {
-            return _hs_open_file_port(dev, mode, rport);
-        } break;
-    }
-
-    assert(false);
-    return 0;
+    return _hs_open_file_port(dev, mode, rport);
 }
 
 void hs_port_close(hs_port *port)
@@ -2034,23 +1984,14 @@ void hs_port_close(hs_port *port)
     if (!port)
         return;
 
-    switch (port->type) {
-        case HS_DEVICE_TYPE_HID: {
 #ifdef __APPLE__
-            _hs_darwin_close_hid_port(port);
-#else
-            _hs_close_file_port(port);
-#endif
-            return;
-        } break;
-
-        case HS_DEVICE_TYPE_SERIAL: {
-            _hs_close_file_port(port);
-            return;
-        } break;
+    if (dev->type == HS_DEVICE_TYPE_HID) {
+        _hs_darwin_close_hid_port(dev, mode, rport);
+        return;
     }
+#endif
 
-    assert(false);
+    _hs_close_file_port(port);
 }
 
 hs_device *hs_port_get_device(const hs_port *port)
@@ -2063,22 +2004,12 @@ hs_handle hs_port_get_poll_handle(const hs_port *port)
 {
     assert(port);
 
-    switch (port->type) {
-        case HS_DEVICE_TYPE_HID: {
 #ifdef __APPLE__
-            return _hs_darwin_get_hid_port_poll_handle(port);
-#else
-            return _hs_get_file_port_poll_handle(port);
+    if (dev->type == HS_DEVICE_TYPE_HID)
+        return _hs_darwin_get_hid_port_poll_handle(port);
 #endif
-        } break;
 
-        case HS_DEVICE_TYPE_SERIAL: {
-            return _hs_get_file_port_poll_handle(port);
-        } break;
-    }
-
-    assert(false);
-    return 0;
+    return _hs_get_file_port_poll_handle(port);
 }
 
 // match.c
@@ -2283,7 +2214,7 @@ int hs_find(const hs_match_spec *matches, unsigned int count, hs_device **rdev)
 void _hs_monitor_clear_devices(_hs_htable *devices)
 {
     _hs_htable_foreach(cur, devices) {
-        hs_device *dev = _hs_container_of(cur, hs_device, hnode);
+        hs_device *dev = _HS_CONTAINER_OF(cur, hs_device, hnode);
         hs_device_unref(dev);
     }
     _hs_htable_clear(devices);
@@ -2292,7 +2223,7 @@ void _hs_monitor_clear_devices(_hs_htable *devices)
 bool _hs_monitor_has_device(_hs_htable *devices, const char *key, uint8_t iface)
 {
     _hs_htable_foreach_hash(cur, devices, _hs_htable_hash_str(key)) {
-        hs_device *dev = _hs_container_of(cur, hs_device, hnode);
+        hs_device *dev = _HS_CONTAINER_OF(cur, hs_device, hnode);
 
         if (strcmp(dev->key, key) == 0 && dev->iface_number == iface)
             return true;
@@ -2322,7 +2253,7 @@ void _hs_monitor_remove(_hs_htable *devices, const char *key, hs_enumerate_func 
                         void *udata)
 {
     _hs_htable_foreach_hash(cur, devices, _hs_htable_hash_str(key)) {
-        hs_device *dev = _hs_container_of(cur, hs_device, hnode);
+        hs_device *dev = _HS_CONTAINER_OF(cur, hs_device, hnode);
 
         if (strcmp(dev->key, key) == 0) {
             dev->status = HS_DEVICE_STATUS_DISCONNECTED;
@@ -2341,7 +2272,7 @@ void _hs_monitor_remove(_hs_htable *devices, const char *key, hs_enumerate_func 
 int _hs_monitor_list(_hs_htable *devices, hs_enumerate_func *f, void *udata)
 {
     _hs_htable_foreach(cur, devices) {
-        hs_device *dev = _hs_container_of(cur, hs_device, hnode);
+        hs_device *dev = _HS_CONTAINER_OF(cur, hs_device, hnode);
         int r;
 
         r = (*f)(dev, udata);
@@ -2644,9 +2575,9 @@ ssize_t _hs_win32_write_sync(hs_port *port, const uint8_t *buf, size_t size, int
 // #include "common_priv.h"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-HS_BEGIN_C
+_HS_BEGIN_C
     #include <hidsdi.h>
-HS_END_C
+_HS_END_C
 #include <winioctl.h>
 // #include "device_priv.h"
 // #include "hid.h"
@@ -2768,10 +2699,10 @@ ssize_t hs_hid_send_feature_report(hs_port *port, const uint8_t *buf, size_t siz
 #include <cfgmgr32.h>
 #include <dbt.h>
 #include <devioctl.h>
-HS_BEGIN_C
+_HS_BEGIN_C
     #include <hidsdi.h>
     #include <hidpi.h>
-HS_END_C
+_HS_END_C
 #include <initguid.h>
 #include <process.h>
 #include <setupapi.h>
@@ -2919,7 +2850,9 @@ static int build_device_path(const char *id, const GUID *guid, char **rpath)
     if (!path)
         return hs_error(HS_ERROR_MEMORY, NULL);
 
-    ptr = _hs_stpcpy(path, "\\\\.\\");
+    strcpy(path, "\\\\.\\");
+    ptr = path + 4;
+
     while (*id) {
         if (*id == '\\') {
             *ptr++ = '#';
@@ -2948,8 +2881,8 @@ static int build_location_string(uint8_t ports[], unsigned int depth, char **rpa
     ptr = buf;
     size = sizeof(buf);
 
-    strcpy(buf, "usb");
-    ptr += strlen(buf);
+    ptr = strcpy(buf, "usb");
+    ptr = buf + 3;
     size -= (size_t)(ptr - buf);
 
     for (size_t i = 0; i < depth; i++) {
@@ -3519,7 +3452,7 @@ static int get_device_comport(DEVINST inst, char **rnode)
 {
     HKEY key;
     char buf[32];
-    DWORD type, len;
+    DWORD len;
     char *node;
     CONFIGRET cret;
     LONG ret;
@@ -3531,19 +3464,15 @@ static int get_device_comport(DEVINST inst, char **rnode)
         return 0;
     }
 
-    len = (DWORD)sizeof(buf) - 1;
-    ret = RegQueryValueEx(key, "PortName", NULL, &type, (BYTE *)buf, &len);
+    len = (DWORD)sizeof(buf);
+    ret = RegGetValue(key, "", "PortName", RRF_RT_REG_SZ, NULL, (BYTE *)buf, &len);
     RegCloseKey(key);
     if (ret != ERROR_SUCCESS) {
         if (ret != ERROR_FILE_NOT_FOUND)
             hs_log(HS_LOG_WARNING, "RegQueryValue() failed: %ld", ret);
         return 0;
     }
-
-    /* If the string is stored without a terminating NUL, the buffer won't have it either.
-       Microsoft fixed it with RegGetValue(), but this function requires Vista. */
-    if (buf[--len])
-        buf[len + 1] = 0;
+    len--;
 
     // You need the \\.\ prefix to open COM ports beyond COM9
     r = _hs_asprintf(&node, "%s%s", len > 4 ? "\\\\.\\" : "", buf);
@@ -3908,26 +3837,26 @@ static LRESULT __stdcall window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM 
 
     switch (msg) {
         case WM_DEVICECHANGE: {
-            DEV_BROADCAST_DEVICEINTERFACE *msg = (DEV_BROADCAST_DEVICEINTERFACE *)lparam;
+            DEV_BROADCAST_DEVICEINTERFACE *msg2 = (DEV_BROADCAST_DEVICEINTERFACE *)lparam;
 
-            if (msg->dbcc_devicetype != DBT_DEVTYP_DEVICEINTERFACE)
+            if (msg2->dbcc_devicetype != DBT_DEVTYP_DEVICEINTERFACE)
                 break;
 
             r = 0;
             switch (wparam) {
                 case DBT_DEVICEARRIVAL: {
-                    r = post_event(monitor, DEVICE_EVENT_ADDED, msg->dbcc_name);
+                    r = post_event(monitor, DEVICE_EVENT_ADDED, msg2->dbcc_name);
                 } break;
 
                 case DBT_DEVICEREMOVECOMPLETE: {
-                    r = post_event(monitor, DEVICE_EVENT_REMOVED, msg->dbcc_name);
+                    r = post_event(monitor, DEVICE_EVENT_REMOVED, msg2->dbcc_name);
                 } break;
             }
 
             if (!r) {
                 UINT_PTR timer;
 
-                timer = SetTimer(monitor->thread_hwnd, 1, 100, NULL);
+                timer = SetTimer(hwnd, 1, 100, NULL);
                 if (!timer)
                     r = hs_error(HS_ERROR_SYSTEM, "SetTimer() failed: %s", hs_win32_strerror(0));
             }
@@ -4270,43 +4199,16 @@ int hs_monitor_list(hs_monitor *monitor, hs_enumerate_func *f, void *udata)
 #include <windows.h>
 // #include "platform.h"
 
-typedef ULONGLONG WINAPI GetTickCount64_func(void);
 typedef LONG NTAPI RtlGetVersion_func(OSVERSIONINFOW *info);
-
-static ULONGLONG WINAPI GetTickCount64_resolve(void);
-static GetTickCount64_func *GetTickCount64_ = GetTickCount64_resolve;
-static LONG NTAPI RtlGetVersion_resolve(OSVERSIONINFOW *info);
-static RtlGetVersion_func *RtlGetVersion_ = RtlGetVersion_resolve;
-
-static ULONGLONG WINAPI GetTickCount64_fallback(void)
-{
-    static LARGE_INTEGER freq;
-    LARGE_INTEGER now;
-    BOOL ret _HS_POSSIBLY_UNUSED;
-
-    if (!freq.QuadPart) {
-        ret = QueryPerformanceFrequency(&freq);
-        assert(ret);
-    }
-
-    ret = QueryPerformanceCounter(&now);
-    assert(ret);
-
-    return (ULONGLONG)now.QuadPart * 1000 / (ULONGLONG)freq.QuadPart;
-}
-
-static ULONGLONG WINAPI GetTickCount64_resolve(void)
-{
-    GetTickCount64_ = (GetTickCount64_func *)GetProcAddress(GetModuleHandle("kernel32.dll"), "GetTickCount64");
-    if (!GetTickCount64_)
-        GetTickCount64_ = GetTickCount64_fallback;
-
-    return GetTickCount64_();
-}
 
 uint64_t hs_millis(void)
 {
-    return GetTickCount64_();
+    return GetTickCount64();
+}
+
+void hs_delay(unsigned int ms)
+{
+    Sleep(ms);
 }
 
 int hs_poll(hs_poll_source *sources, unsigned int count, int timeout)
@@ -4359,13 +4261,6 @@ const char *hs_win32_strerror(DWORD err)
     return buf;
 }
 
-static LONG NTAPI RtlGetVersion_resolve(OSVERSIONINFOW *info)
-{
-    RtlGetVersion_ = (RtlGetVersion_func *)GetProcAddress(GetModuleHandle("ntdll.dll"),
-                                                          "RtlGetVersion");
-    return RtlGetVersion_(info);
-}
-
 uint32_t hs_win32_version(void)
 {
     static uint32_t version;
@@ -4375,7 +4270,10 @@ uint32_t hs_win32_version(void)
 
         // Windows 8.1 broke GetVersionEx, so bypass the intermediary
         info.dwOSVersionInfoSize = sizeof(info);
-        RtlGetVersion_(&info);
+
+        RtlGetVersion_func *RtlGetVersion =
+            (RtlGetVersion_func *)GetProcAddress(GetModuleHandle("ntdll.dll"), "RtlGetVersion");
+        RtlGetVersion(&info);
 
         version = info.dwMajorVersion * 100 + info.dwMinorVersion;
     }
@@ -6053,6 +5951,27 @@ uint64_t hs_millis(void)
     return (uint64_t)mach_absolute_time() * tb.numer / tb.denom / 1000000;
 }
 
+void hs_delay(unsigned int ms)
+{
+    struct timespec t, rem;
+    int r;
+
+    t.tv_sec = (int)(ms / 1000);
+    t.tv_nsec = (int)((ms % 1000) * 1000000);
+
+    do {
+        r = nanosleep(&t, &rem);
+        if (r < 0) {
+            if (errno != EINTR) {
+                ty_error(TY_ERROR_SYSTEM, "nanosleep() failed: %s", strerror(errno));
+                return;
+            }
+
+            t = rem;
+        }
+    } while (r);
+}
+
 int hs_poll(hs_poll_source *sources, unsigned int count, int timeout)
 {
     assert(sources);
@@ -6915,50 +6834,35 @@ static int fill_device_details(struct udev_aggregate *agg, hs_device *dev)
     if (r <= 0)
         return r;
 
-    errno = 0;
-    buf = udev_device_get_sysattr_value(agg->usb, "idVendor");
-    if (!buf)
-        return 0;
-    dev->vid = (uint16_t)strtoul(buf, NULL, 16);
-    if (errno)
-        return 0;
+#define READ_UINT16_ATTRIBUTE(name, ptr) \
+        do { \
+            errno = 0; \
+            buf = udev_device_get_sysattr_value(agg->usb, (name)); \
+            if (!buf) \
+                return 0; \
+            *(ptr) = (uint16_t)strtoul(buf, NULL, 16); \
+            if (errno) \
+                return 0; \
+        } while (false)
+#define READ_STR_ATTRIBUTE(name, ptr) \
+        do { \
+            buf = udev_device_get_sysattr_value(agg->usb, (name)); \
+            if (buf) { \
+                *(ptr) = strdup(buf); \
+                if (!*(ptr)) \
+                    return hs_error(HS_ERROR_MEMORY, NULL); \
+            } \
+        } while (false)
 
-    errno = 0;
-    buf = udev_device_get_sysattr_value(agg->usb, "idProduct");
-    if (!buf)
-        return 0;
-    dev->pid = (uint16_t)strtoul(buf, NULL, 16);
-    if (errno)
-        return 0;
+    READ_UINT16_ATTRIBUTE("idVendor", &dev->vid);
+    READ_UINT16_ATTRIBUTE("idProduct", &dev->pid);
+    READ_UINT16_ATTRIBUTE("bcdDevice", &dev->bcd_device);
+    READ_STR_ATTRIBUTE("manufacturer", &dev->manufacturer_string);
+    READ_STR_ATTRIBUTE("product", &dev->product_string);
+    READ_STR_ATTRIBUTE("serial", &dev->serial_number_string);
 
-    errno = 0;
-    buf = udev_device_get_sysattr_value(agg->usb, "bcdDevice");
-    if (!buf)
-        return 0;
-    dev->bcd_device = (uint16_t)strtoul(buf, NULL, 16);
-    if (errno)
-        return 0;
-
-    buf = udev_device_get_sysattr_value(agg->usb, "manufacturer");
-    if (buf) {
-        dev->manufacturer_string = strdup(buf);
-        if (!dev->manufacturer_string)
-            return hs_error(HS_ERROR_MEMORY, NULL);
-    }
-
-    buf = udev_device_get_sysattr_value(agg->usb, "product");
-    if (buf) {
-        dev->product_string = strdup(buf);
-        if (!dev->product_string)
-            return hs_error(HS_ERROR_MEMORY, NULL);
-    }
-
-    buf = udev_device_get_sysattr_value(agg->usb, "serial");
-    if (buf) {
-        dev->serial_number_string = strdup(buf);
-        if (!dev->serial_number_string)
-            return hs_error(HS_ERROR_MEMORY, NULL);
-    }
+#undef READ_STR_ATTRIBUTE
+#undef READ_UINT16_ATTRIBUTE
 
     errno = 0;
     buf = udev_device_get_devpath(agg->iface);
@@ -7510,6 +7414,27 @@ uint64_t hs_millis(void)
     assert(!r);
 
     return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 10000000;
+}
+
+void hs_delay(unsigned int ms)
+{
+    struct timespec t, rem;
+    int r;
+
+    t.tv_sec = (int)(ms / 1000);
+    t.tv_nsec = (int)((ms % 1000) * 1000000);
+
+    do {
+        r = nanosleep(&t, &rem);
+        if (r < 0) {
+            if (errno != EINTR) {
+                ty_error(TY_ERROR_SYSTEM, "nanosleep() failed: %s", strerror(errno));
+                return;
+            }
+
+            t = rem;
+        }
+    } while (r);
 }
 
 int hs_poll(hs_poll_source *sources, unsigned int count, int timeout)
