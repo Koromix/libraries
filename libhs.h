@@ -1985,8 +1985,8 @@ void hs_port_close(hs_port *port)
         return;
 
 #ifdef __APPLE__
-    if (dev->type == HS_DEVICE_TYPE_HID) {
-        _hs_darwin_close_hid_port(dev, mode, rport);
+    if (port->type == HS_DEVICE_TYPE_HID) {
+        _hs_darwin_close_hid_port(port);
         return;
     }
 #endif
@@ -2005,7 +2005,7 @@ hs_handle hs_port_get_poll_handle(const hs_port *port)
     assert(port);
 
 #ifdef __APPLE__
-    if (dev->type == HS_DEVICE_TYPE_HID)
+    if (port->type == HS_DEVICE_TYPE_HID)
         return _hs_darwin_get_hid_port_poll_handle(port);
 #endif
 
@@ -5963,7 +5963,7 @@ void hs_delay(unsigned int ms)
         r = nanosleep(&t, &rem);
         if (r < 0) {
             if (errno != EINTR) {
-                ty_error(TY_ERROR_SYSTEM, "nanosleep() failed: %s", strerror(errno));
+                hs_error(HS_ERROR_SYSTEM, "nanosleep() failed: %s", strerror(errno));
                 return;
             }
 
@@ -7428,7 +7428,7 @@ void hs_delay(unsigned int ms)
         r = nanosleep(&t, &rem);
         if (r < 0) {
             if (errno != EINTR) {
-                ty_error(TY_ERROR_SYSTEM, "nanosleep() failed: %s", strerror(errno));
+                hs_error(HS_ERROR_SYSTEM, "nanosleep() failed: %s", strerror(errno));
                 return;
             }
 
