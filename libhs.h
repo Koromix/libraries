@@ -126,7 +126,7 @@ typedef long ssize_t;
     ((type *)((char *)(head) - (size_t)(&((type *)0)->member)))
 
 int _hs_asprintf(char **strp, const char *fmt, ...) _HS_PRINTF_FORMAT(2, 3);
-int _hs_vasprintf(char **strp, const char *fmt, va_list ap);
+int _hs_vasprintf(char **strp, const char *fmt, va_list ap) _HS_PRINTF_FORMAT(2, 0);
 
 #if defined(DOXYGEN)
 /**
@@ -889,7 +889,7 @@ struct hs_match_spec {
  * 0123:abcd     | Match devices with VID:PID pair 0x0123:0xABCD
  *
  * @param      str    Human-readable match string.
- * @param[out] rmatch A pointer to the variable that receives the device match specifier,
+ * @param[out] rspec  A pointer to the variable that receives the device match specifier,
  *     it will stay unchanged if the function fails.
  * @return This function returns 0 on success, or a negative @ref hs_error_code value.
  */
@@ -2167,6 +2167,8 @@ hs_handle _hs_get_file_port_poll_handle(const hs_port *port)
 // device_win32.c
 // ------------------------------------
 
+#ifdef _WIN32
+
 // #include "common_priv.h"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -2547,6 +2549,8 @@ bool _hs_match_helper_has_type(const _hs_match_helper *helper, hs_device_type ty
 
 // hid_darwin.c
 // ------------------------------------
+
+#ifdef __APPLE__
 
 // #include "common_priv.h"
 #include <CoreFoundation/CFRunLoop.h>
@@ -3038,6 +3042,8 @@ ssize_t hs_hid_send_feature_report(hs_port *port, const uint8_t *buf, size_t siz
 // hid_linux.c
 // ------------------------------------
 
+#ifdef __linux__
+
 // #include "common_priv.h"
 #include <fcntl.h>
 #include <linux/hidraw.h>
@@ -3213,6 +3219,8 @@ restart:
 
 // hid_win32.c
 // ------------------------------------
+
+#ifdef _WIN32
 
 // #include "common_priv.h"
 #define WIN32_LEAN_AND_MEAN
@@ -3494,6 +3502,8 @@ int _hs_monitor_list(_hs_htable *devices, hs_enumerate_func *f, void *udata)
 
 // monitor_linux.c
 // ------------------------------------
+
+#ifdef __linux__
 
 // #include "common_priv.h"
 #include <fcntl.h>
@@ -4174,6 +4184,8 @@ int hs_monitor_list(hs_monitor *monitor, hs_enumerate_func *f, void *udata)
 
 // monitor_win32.c
 // ------------------------------------
+
+#ifdef _WIN32
 
 // #include "common_priv.h"
 #define WIN32_LEAN_AND_MEAN
@@ -5708,6 +5720,8 @@ int hs_monitor_list(hs_monitor *monitor, hs_enumerate_func *f, void *udata)
 // monitor_darwin.c
 // ------------------------------------
 
+#ifdef __APPLE__
+
 // #include "common_priv.h"
 #include <CoreFoundation/CFRunLoop.h>
 #include <IOKit/IOCFPlugIn.h>
@@ -6451,6 +6465,8 @@ int hs_adjust_timeout(int timeout, uint64_t start)
 // platform_darwin.c
 // ------------------------------------
 
+#ifdef __APPLE__
+
 // #include "common_priv.h"
 #include <mach/mach_time.h>
 #include <sys/select.h>
@@ -6566,6 +6582,8 @@ uint32_t hs_darwin_version(void)
 // platform_linux.c
 // ------------------------------------
 
+#ifdef __linux__
+
 // #include "common_priv.h"
 #include <poll.h>
 #include <sys/utsname.h>
@@ -6666,6 +6684,8 @@ uint32_t hs_linux_version(void)
 
 // platform_win32.c
 // ------------------------------------
+
+#ifdef _WIN32
 
 // #include "common_priv.h"
 #define WIN32_LEAN_AND_MEAN
@@ -7118,6 +7138,8 @@ ssize_t hs_serial_write(hs_port *port, const uint8_t *buf, size_t size, int time
 
 // serial_win32.c
 // ------------------------------------
+
+#ifdef _WIN32
 
 // #include "common_priv.h"
 #define WIN32_LEAN_AND_MEAN
