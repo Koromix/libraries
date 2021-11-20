@@ -608,11 +608,14 @@ struct hs_device {
             /** Primary usage value read from the HID report descriptor. */
             uint16_t usage;
 
-#if defined(_WIN32)
-            /** @cond */
-            size_t input_report_len;
-            /** @endcond */
-#elif defined(__linux__)
+            /** Maximum input report size calculated from HID report descriptor. */
+            size_t max_input_len;
+            /** Maximum output report size calculated from HID report descriptor. */
+            size_t max_output_len;
+            /** Maximum feature report size calculated from HID report descriptor. */
+            size_t max_feature_len;
+
+#ifdef __linux__
             /** @cond */
             // Needed to work around a bug on old Linux kernels
             bool numbered_reports;
@@ -1532,13 +1535,6 @@ _HS_END_C
 #endif
 
 #ifdef HS_IMPLEMENTATION
-    #if defined(_MSC_VER)
-        #pragma comment(lib, "user32.lib")
-        #pragma comment(lib, "advapi32.lib")
-        #pragma comment(lib, "setupapi.lib")
-        #pragma comment(lib, "hid.lib")
-    #endif
-
 // common_priv.h
 // ------------------------------------
 
@@ -1905,7 +1901,7 @@ hs_device *hs_device_ref(hs_device *dev)
     assert(dev);
 
 #ifdef _MSC_VER
-    InterlockedIncrement(&dev->refcount);
+    InterlockedIncrement((long *)&dev->refcount);
 #else
     __atomic_fetch_add(&dev->refcount, 1, __ATOMIC_RELAXED);
 #endif
@@ -1916,7 +1912,7 @@ void hs_device_unref(hs_device *dev)
 {
     if (dev) {
 #ifdef _MSC_VER
-        if (InterlockedDecrement(&dev->refcount))
+        if (InterlockedDecrement((long *)&dev->refcount))
             return;
 #else
         if (__atomic_fetch_sub(&dev->refcount, 1, __ATOMIC_RELEASE) > 1)
@@ -2012,2594 +2008,10 @@ hs_handle hs_port_get_poll_handle(const hs_port *port)
     return _hs_get_file_port_poll_handle(port);
 }
 
-// match.c
-// ------------------------------------
-
-// #include "common_priv.h"
-#ifndef _WIN32
-    #include <sys/stat.h>
-#endif
-// #include "match_priv.h"
-
-int hs_match_parse(const char *str, hs_match_spec *rspec)
-{
-    unsigned int vid = 0, pid = 0, type = 0;
-
-    str += strspn(str, " ");
-    if (str[0]) {
-        char type_buf[16];
-        int r;
-
-        r = sscanf(str, "%04x:%04x/%15s", &vid, &pid, type_buf);
-        if (r < 2)
-            return hs_error(HS_ERROR_PARSE, "Malformed device match string '%s'", str);
-
-        if (r == 3) {
-            for (unsigned int i = 1; i < _HS_COUNTOF(hs_device_type_strings); i++) {
-                if (!strcmp(hs_device_type_strings[i], type_buf))
-                    type = i;
-            }
-            if (!type)
-                return hs_error(HS_ERROR_PARSE, "Unknown device type '%s' in match string '%s'",
-                                type_buf, str);
-        }
-    }
-
-    memset(rspec, 0, sizeof(*rspec));
-    rspec->vid = (uint16_t)vid;
-    rspec->pid = (uint16_t)pid;
-    rspec->type = type;
-    return 0;
-}
-
-int _hs_match_helper_init(_hs_match_helper *helper, const hs_match_spec *specs,
-                          unsigned int specs_count)
-{
-    if (!specs) {
-        helper->specs = NULL;
-        helper->specs_count = 0;
-        helper->types = UINT32_MAX;
-
-        return 0;
-    }
-
-    // I promise to be careful
-    helper->specs = specs_count ? (hs_match_spec *)specs : NULL;
-    helper->specs_count = specs_count;
-
-    helper->types = 0;
-    for (unsigned int i = 0; i < specs_count; i++) {
-        if (!specs[i].type) {
-            helper->types = UINT32_MAX;
-            break;
-        }
-
-        helper->types |= (uint32_t)(1 << specs[i].type);
-    }
-
-    return 0;
-}
-
-void _hs_match_helper_release(_hs_match_helper *helper)
-{
-    _HS_UNUSED(helper);
-}
-
-static bool test_spec(const hs_match_spec *spec, const hs_device *dev)
-{
-    if (spec->type && dev->type != (hs_device_type)spec->type)
-        return false;
-    if (spec->vid && dev->vid != spec->vid)
-        return false;
-    if (spec->pid && dev->pid != spec->pid)
-        return false;
-
-    return true;
-}
-
-bool _hs_match_helper_match(const _hs_match_helper *helper, const hs_device *dev,
-                            void **rmatch_udata)
-{
-    // Do the fast checks first
-    if (!_hs_match_helper_has_type(helper, dev->type))
-        return false;
-    if (!helper->specs_count) {
-        if (rmatch_udata)
-            *rmatch_udata = NULL;
-        return true;
-    }
-
-    for (unsigned int i = 0; i < helper->specs_count; i++) {
-        if (test_spec(&helper->specs[i], dev)) {
-            if (rmatch_udata)
-                *rmatch_udata = helper->specs[i].udata;
-            return true;
-        }
-    }
-
-    return false;
-}
-
-bool _hs_match_helper_has_type(const _hs_match_helper *helper, hs_device_type type)
-{
-    return helper->types & (uint32_t)(1 << type);
-}
-
-// htable.c
-// ------------------------------------
-
-// #include "common_priv.h"
-// #include "htable.h"
-
-int _hs_htable_init(_hs_htable *table, unsigned int size)
-{
-    table->heads = (void **)malloc(size * sizeof(*table->heads));
-    if (!table->heads)
-        return hs_error(HS_ERROR_MEMORY, NULL);
-    table->size = size;
-
-    _hs_htable_clear(table);
-
-    return 0;
-}
-
-void _hs_htable_release(_hs_htable *table)
-{
-    free(table->heads);
-}
-
-_hs_htable_head *_hs_htable_get_head(_hs_htable *table, uint32_t key)
-{
-    return (_hs_htable_head *)&table->heads[key % table->size];
-}
-
-void _hs_htable_add(_hs_htable *table, uint32_t key, _hs_htable_head *n)
-{
-    _hs_htable_head *head = _hs_htable_get_head(table, key);
-
-    n->key = key;
-
-    n->next = head->next;
-    head->next = n;
-}
-
-void _hs_htable_insert(_hs_htable_head *prev, _hs_htable_head *n)
-{
-    n->key = prev->key;
-
-    n->next = prev->next;
-    prev->next = n;
-}
-
-void _hs_htable_remove(_hs_htable_head *head)
-{
-    for (_hs_htable_head *prev = head->next; prev != head; prev = prev->next) {
-        if (prev->next == head) {
-            prev->next = head->next;
-            head->next = NULL;
-
-            break;
-        }
-    }
-}
-
-void _hs_htable_clear(_hs_htable *table)
-{
-    for (unsigned int i = 0; i < table->size; i++)
-        table->heads[i] = (_hs_htable_head *)&table->heads[i];
-}
-
-// monitor_common.c
-// ------------------------------------
-
-// #include "common_priv.h"
-// #include "device_priv.h"
-// #include "match.h"
-// #include "monitor_priv.h"
-
-static int find_callback(hs_device *dev, void *udata)
-{
-    hs_device **rdev = (hs_device **)udata;
-
-    *rdev = hs_device_ref(dev);
-    return 1;
-}
-
-int hs_find(const hs_match_spec *matches, unsigned int count, hs_device **rdev)
-{
-    assert(rdev);
-    return hs_enumerate(matches, count, find_callback, rdev);
-}
-
-void _hs_monitor_clear_devices(_hs_htable *devices)
-{
-    _hs_htable_foreach(cur, devices) {
-        hs_device *dev = _HS_CONTAINER_OF(cur, hs_device, hnode);
-        hs_device_unref(dev);
-    }
-    _hs_htable_clear(devices);
-}
-
-bool _hs_monitor_has_device(_hs_htable *devices, const char *key, uint8_t iface)
-{
-    _hs_htable_foreach_hash(cur, devices, _hs_htable_hash_str(key)) {
-        hs_device *dev = _HS_CONTAINER_OF(cur, hs_device, hnode);
-
-        if (strcmp(dev->key, key) == 0 && dev->iface_number == iface)
-            return true;
-    }
-
-    return false;
-}
-
-int _hs_monitor_add(_hs_htable *devices, hs_device *dev, hs_enumerate_func *f, void *udata)
-{
-    if (_hs_monitor_has_device(devices, dev->key, dev->iface_number))
-        return 0;
-
-    hs_device_ref(dev);
-    _hs_htable_add(devices, _hs_htable_hash_str(dev->key), &dev->hnode);
-
-    _hs_device_log(dev, "Add");
-
-    if (f) {
-        return (*f)(dev, udata);
-    } else {
-        return 0;
-    }
-}
-
-void _hs_monitor_remove(_hs_htable *devices, const char *key, hs_enumerate_func *f,
-                        void *udata)
-{
-    _hs_htable_foreach_hash(cur, devices, _hs_htable_hash_str(key)) {
-        hs_device *dev = _HS_CONTAINER_OF(cur, hs_device, hnode);
-
-        if (strcmp(dev->key, key) == 0) {
-            dev->status = HS_DEVICE_STATUS_DISCONNECTED;
-
-            hs_log(HS_LOG_DEBUG, "Remove device '%s'", dev->key);
-
-            if (f)
-                (*f)(dev, udata);
-
-            _hs_htable_remove(&dev->hnode);
-            hs_device_unref(dev);
-        }
-    }
-}
-
-int _hs_monitor_list(_hs_htable *devices, hs_enumerate_func *f, void *udata)
-{
-    _hs_htable_foreach(cur, devices) {
-        hs_device *dev = _HS_CONTAINER_OF(cur, hs_device, hnode);
-        int r;
-
-        r = (*f)(dev, udata);
-        if (r)
-            return r;
-    }
-
-    return 0;
-}
-
-// platform.c
-// ------------------------------------
-
-// #include "common_priv.h"
-// #include "platform.h"
-
-int hs_adjust_timeout(int timeout, uint64_t start)
-{
-    if (timeout < 0)
-        return -1;
-
-    uint64_t now = hs_millis();
-
-    if (now > start + (uint64_t)timeout)
-        return 0;
-    return (int)(start + (uint64_t)timeout - now);
-}
-
-
-    #if defined(_WIN32)
-// device_win32.c
-// ------------------------------------
-
-// #include "common_priv.h"
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#include <process.h>
-// #include "device_priv.h"
-// #include "platform.h"
-
-#define READ_BUFFER_SIZE 16384
-
-int _hs_open_file_port(hs_device *dev, hs_port_mode mode, hs_port **rport)
-{
-    hs_port *port = NULL;
-    DWORD access;
-    int r;
-
-    port = (hs_port *)calloc(1, sizeof(*port));
-    if (!port) {
-        r = hs_error(HS_ERROR_MEMORY, NULL);
-        goto error;
-    }
-    port->type = dev->type;
-
-    port->mode = mode;
-    port->path = dev->path;
-    port->dev = hs_device_ref(dev);
-
-    access = UINT32_MAX;
-    switch (mode) {
-        case HS_PORT_MODE_READ: { access = GENERIC_READ; } break;
-        case HS_PORT_MODE_WRITE: { access = GENERIC_WRITE; } break;
-        case HS_PORT_MODE_RW: { access = GENERIC_READ | GENERIC_WRITE; } break;
-    }
-    assert(access != UINT32_MAX);
-
-    port->u.handle.h = CreateFile(dev->path, access, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                  NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
-    if (port->u.handle.h == INVALID_HANDLE_VALUE) {
-        switch (GetLastError()) {
-            case ERROR_FILE_NOT_FOUND:
-            case ERROR_PATH_NOT_FOUND: {
-                r = hs_error(HS_ERROR_NOT_FOUND, "Device '%s' not found", dev->path);
-            } break;
-            case ERROR_NOT_ENOUGH_MEMORY:
-            case ERROR_OUTOFMEMORY: {
-                r = hs_error(HS_ERROR_MEMORY, NULL);
-            } break;
-            case ERROR_ACCESS_DENIED: {
-                r = hs_error(HS_ERROR_ACCESS, "Permission denied for device '%s'", dev->path);
-            } break;
-
-            default: {
-                r = hs_error(HS_ERROR_SYSTEM, "CreateFile('%s') failed: %s", dev->path,
-                             hs_win32_strerror(0));
-            } break;
-        }
-        goto error;
-    }
-
-    if (dev->type == HS_DEVICE_TYPE_SERIAL) {
-        DCB dcb;
-        COMMTIMEOUTS timeouts;
-        BOOL success;
-
-        dcb.DCBlength = sizeof(dcb);
-        success = GetCommState(port->u.handle.h, &dcb);
-        if (!success) {
-            r = hs_error(HS_ERROR_SYSTEM, "GetCommState() failed on '%s': %s", port->path,
-                         hs_win32_strerror(0));
-            goto error;
-        }
-
-        /* Sane config, inspired by libserialport, and with DTR pin on by default for
-           consistency with UNIX platforms. */
-        dcb.fBinary = TRUE;
-        dcb.fAbortOnError = FALSE;
-        dcb.fErrorChar = FALSE;
-        dcb.fNull = FALSE;
-        dcb.fDtrControl = DTR_CONTROL_ENABLE;
-        dcb.fDsrSensitivity = FALSE;
-
-        /* See SERIAL_TIMEOUTS documentation on MSDN, this basically means "Terminate read request
-           when there is at least one byte available". You still need a total timeout in that mode
-           so use 0xFFFFFFFE (using 0xFFFFFFFF for all read timeouts is not allowed). Using
-           WaitCommEvent() instead would probably be a good idea, I'll look into that later. */
-        timeouts.ReadIntervalTimeout = ULONG_MAX;
-        timeouts.ReadTotalTimeoutMultiplier = ULONG_MAX;
-        timeouts.ReadTotalTimeoutConstant = ULONG_MAX - 1;
-        timeouts.WriteTotalTimeoutMultiplier = 0;
-        timeouts.WriteTotalTimeoutConstant = 5000;
-
-        success = SetCommState(port->u.handle.h, &dcb);
-        if (!success) {
-            r = hs_error(HS_ERROR_SYSTEM, "SetCommState() failed on '%s': %s",
-                         port->path, hs_win32_strerror(0));
-            goto error;
-        }
-        success = SetCommTimeouts(port->u.handle.h, &timeouts);
-        if (!success) {
-            r = hs_error(HS_ERROR_SYSTEM, "SetCommTimeouts() failed on '%s': %s",
-                         port->path, hs_win32_strerror(0));
-            goto error;
-        }
-        success = PurgeComm(port->u.handle.h, PURGE_RXCLEAR);
-        if (!success) {
-            r = hs_error(HS_ERROR_SYSTEM, "PurgeComm(PURGE_RXCLEAR) failed on '%s': %s",
-                         port->path, hs_win32_strerror(0));
-            goto error;
-        }
-    }
-
-    if (mode & HS_PORT_MODE_READ) {
-        port->u.handle.read_ov = (OVERLAPPED *)calloc(1, sizeof(*port->u.handle.read_ov));
-        if (!port->u.handle.read_ov) {
-            r = hs_error(HS_ERROR_MEMORY, NULL);
-            goto error;
-        }
-
-        port->u.handle.read_ov->hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-        if (!port->u.handle.read_ov->hEvent) {
-            r = hs_error(HS_ERROR_SYSTEM, "CreateEvent() failed: %s", hs_win32_strerror(0));
-            goto error;
-        }
-
-        if (dev->type == HS_DEVICE_TYPE_HID) {
-            port->u.handle.read_buf_size = dev->u.hid.input_report_len;
-        } else {
-            port->u.handle.read_buf_size = READ_BUFFER_SIZE;
-        }
-
-        if (port->u.handle.read_buf_size) {
-            port->u.handle.read_buf = (uint8_t *)malloc(port->u.handle.read_buf_size);
-            if (!port->u.handle.read_buf) {
-                r = hs_error(HS_ERROR_MEMORY, NULL);
-                goto error;
-            }
-
-            _hs_win32_start_async_read(port);
-            if (port->u.handle.read_status < 0) {
-                r = port->u.handle.read_status;
-                goto error;
-            }
-        }
-    }
-
-    if (mode & HS_PORT_MODE_WRITE) {
-        port->u.handle.write_event = CreateEvent(NULL, TRUE, FALSE, NULL);
-        if (!port->u.handle.write_event) {
-            r = hs_error(HS_ERROR_SYSTEM, "CreateEvent() failed: %s", hs_win32_strerror(0));
-            goto error;
-        }
-    }
-
-    *rport = port;
-    return 0;
-
-error:
-    hs_port_close(port);
-    return r;
-}
-
-void _hs_close_file_port(hs_port *port)
-{
-    if (port) {
-        hs_device_unref(port->dev);
-        port->dev = NULL;
-
-        if (CancelIoEx(port->u.handle.h, NULL))
-            WaitForSingleObject(port->u.handle.read_ov->hEvent, INFINITE);
-        if (port->u.handle.h)
-            CloseHandle(port->u.handle.h);
-
-        free(port->u.handle.read_buf);
-        if (port->u.handle.read_ov && port->u.handle.read_ov->hEvent)
-            CloseHandle(port->u.handle.read_ov->hEvent);
-        free(port->u.handle.read_ov);
-
-        if (port->u.handle.write_event)
-            CloseHandle(port->u.handle.write_event);
-    }
-
-    free(port);
-}
-
-hs_handle _hs_get_file_port_poll_handle(const hs_port *port)
-{
-    return port->u.handle.read_ov->hEvent;
-}
-
-// Call only when port->status != 0, otherwise you will leak kernel memory
-void _hs_win32_start_async_read(hs_port *port)
-{
-    DWORD ret;
-
-    ret = (DWORD)ReadFile(port->u.handle.h, port->u.handle.read_buf,
-                          (DWORD)port->u.handle.read_buf_size, NULL, port->u.handle.read_ov);
-    if (!ret && GetLastError() != ERROR_IO_PENDING) {
-        CancelIo(port->u.handle.h);
-
-        port->u.handle.read_status = hs_error(HS_ERROR_IO, "I/O error while reading from '%s'",
-                                           port->path);
-        return;
-    }
-
-    port->u.handle.read_status = 0;
-}
-
-void _hs_win32_finalize_async_read(hs_port *port, int timeout)
-{
-    DWORD len, ret;
-
-    if (!port->u.handle.read_buf_size)
-        return;
-
-    if (timeout > 0)
-        WaitForSingleObject(port->u.handle.read_ov->hEvent, (DWORD)timeout);
-    ret = (DWORD)GetOverlappedResult(port->u.handle.h, port->u.handle.read_ov, &len, timeout < 0);
-    if (!ret) {
-        if (GetLastError() == ERROR_IO_INCOMPLETE) {
-            port->u.handle.read_status = 0;
-            return;
-        }
-
-        port->u.handle.read_status = hs_error(HS_ERROR_IO, "I/O error while reading from '%s'",
-                                              port->path);
-        return;
-    }
-
-    port->u.handle.read_len = (size_t)len;
-    port->u.handle.read_ptr = port->u.handle.read_buf;
-
-    port->u.handle.read_status = 1;
-}
-
-ssize_t _hs_win32_write_sync(hs_port *port, const uint8_t *buf, size_t size, int timeout)
-{
-    OVERLAPPED ov = {0};
-    DWORD len;
-    BOOL success;
-
-    ov.hEvent = port->u.handle.write_event;
-    success = WriteFile(port->u.handle.h, buf, (DWORD)size, NULL, &ov);
-    if (!success && GetLastError() != ERROR_IO_PENDING)
-        return hs_error(HS_ERROR_IO, "I/O error while writing to '%s'", port->path);
-
-    if (timeout > 0)
-        WaitForSingleObject(ov.hEvent, (DWORD)timeout);
-
-    success = GetOverlappedResult(port->u.handle.h, &ov, &len, timeout < 0);
-    if (!success) {
-        if (GetLastError() == ERROR_IO_INCOMPLETE) {
-            CancelIoEx(port->u.handle.h, &ov);
-
-            success = GetOverlappedResult(port->u.handle.h, &ov, &len, TRUE);
-            if (!success)
-                len = 0;
-        } else {
-            return hs_error(HS_ERROR_IO, "I/O error while writing to '%s'", port->path);
-        }
-    }
-
-    return (ssize_t)len;
-}
-
-// hid_win32.c
-// ------------------------------------
-
-// #include "common_priv.h"
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-_HS_BEGIN_C
-    #include <hidsdi.h>
-_HS_END_C
-#include <winioctl.h>
-// #include "device_priv.h"
-// #include "hid.h"
-// #include "platform.h"
-
-// Copied from hidclass.h in the MinGW-w64 headers
-#define HID_OUT_CTL_CODE(id) \
-    CTL_CODE(FILE_DEVICE_KEYBOARD, (id), METHOD_OUT_DIRECT, FILE_ANY_ACCESS)
-#define IOCTL_HID_GET_FEATURE HID_OUT_CTL_CODE(100)
-
-ssize_t hs_hid_read(hs_port *port, uint8_t *buf, size_t size, int timeout)
-{
-    assert(port);
-    assert(port->dev->type == HS_DEVICE_TYPE_HID);
-    assert(port->mode & HS_PORT_MODE_READ);
-    assert(buf);
-    assert(size);
-
-    if (port->u.handle.read_status < 0) {
-        // Could be a transient error, try to restart it
-        _hs_win32_start_async_read(port);
-        if (port->u.handle.read_status < 0)
-            return port->u.handle.read_status;
-    }
-
-    _hs_win32_finalize_async_read(port, timeout);
-    if (port->u.handle.read_status <= 0)
-        return port->u.handle.read_status;
-
-    /* HID communication is message-based. So if the caller does not provide a big enough
-       buffer, we can just discard the extra data, unlike for serial communication. */
-    if (port->u.handle.read_len) {
-        if (size > port->u.handle.read_len)
-            size = port->u.handle.read_len;
-        memcpy(buf, port->u.handle.read_buf, size);
-    } else {
-        size = 0;
-    }
-
-    hs_error_mask(HS_ERROR_IO);
-    _hs_win32_start_async_read(port);
-    hs_error_unmask();
-
-    return (ssize_t)size;
-}
-
-ssize_t hs_hid_write(hs_port *port, const uint8_t *buf, size_t size)
-{
-    assert(port);
-    assert(port->dev->type == HS_DEVICE_TYPE_HID);
-    assert(port->mode & HS_PORT_MODE_WRITE);
-    assert(buf);
-
-    if (size < 2)
-        return 0;
-
-    ssize_t r = _hs_win32_write_sync(port, buf, size, 5000);
-    if (!r)
-        return hs_error(HS_ERROR_IO, "Timed out while writing to '%s'", port->dev->path);
-
-    return r;
-}
-
-ssize_t hs_hid_get_feature_report(hs_port *port, uint8_t report_id, uint8_t *buf, size_t size)
-{
-    assert(port);
-    assert(port->dev->type == HS_DEVICE_TYPE_HID);
-    assert(port->mode & HS_PORT_MODE_READ);
-    assert(buf);
-    assert(size);
-
-    OVERLAPPED ov = {0};
-    DWORD len;
-    BOOL success;
-
-    buf[0] = report_id;
-    len = (DWORD)size;
-
-    success = DeviceIoControl(port->u.handle.h, IOCTL_HID_GET_FEATURE, buf, (DWORD)size, buf,
-                              (DWORD)size, NULL, &ov);
-    if (!success && GetLastError() != ERROR_IO_PENDING) {
-        CancelIo(port->u.handle.h);
-        return hs_error(HS_ERROR_IO, "I/O error while writing to '%s'", port->dev->path);
-    }
-
-    success = GetOverlappedResult(port->u.handle.h, &ov, &len, TRUE);
-    if (!success)
-        return hs_error(HS_ERROR_IO, "I/O error while writing to '%s'", port->dev->path);
-
-    /* Apparently the length returned by the IOCTL_HID_GET_FEATURE ioctl does not account
-       for the report ID byte. */
-    return (ssize_t)len + 1;
-}
-
-ssize_t hs_hid_send_feature_report(hs_port *port, const uint8_t *buf, size_t size)
-{
-    assert(port);
-    assert(port->dev->type == HS_DEVICE_TYPE_HID);
-    assert(port->mode & HS_PORT_MODE_WRITE);
-    assert(buf);
-
-    if (size < 2)
-        return 0;
-
-    // Timeout behavior?
-    BOOL success = HidD_SetFeature(port->u.handle.h, (char *)buf, (DWORD)size);
-    if (!success)
-        return hs_error(HS_ERROR_IO, "I/O error while writing to '%s'", port->dev->path);
-
-    return (ssize_t)size;
-}
-
-// monitor_win32.c
-// ------------------------------------
-
-// #include "common_priv.h"
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#include <cfgmgr32.h>
-#include <dbt.h>
-#include <devioctl.h>
-_HS_BEGIN_C
-    #include <hidsdi.h>
-    #include <hidpi.h>
-_HS_END_C
-#include <initguid.h>
-#include <process.h>
-#include <setupapi.h>
-#include <usb.h>
-#include <usbiodef.h>
-#include <usbioctl.h>
-#include <usbuser.h>
-#include <wchar.h>
-// #include "array.h"
-// #include "device_priv.h"
-// #include "match_priv.h"
-// #include "monitor_priv.h"
-// #include "platform.h"
-
-enum event_type {
-    DEVICE_EVENT_ADDED,
-    DEVICE_EVENT_REMOVED
-};
-
-struct event {
-    enum event_type type;
-    char device_key[256];
-};
-
-typedef _HS_ARRAY(struct event) event_array;
-
-struct hs_monitor {
-    _hs_match_helper match_helper;
-    _hs_htable devices;
-
-    HANDLE thread;
-    HWND thread_hwnd;
-
-    HANDLE thread_event;
-    CRITICAL_SECTION events_lock;
-    event_array events;
-    event_array thread_events;
-    event_array refresh_events;
-    int thread_ret;
-};
-
-struct setup_class {
-    const char *name;
-    hs_device_type type;
-};
-
-struct device_cursor {
-    DEVINST inst;
-    char id[256];
-};
-
-enum device_cursor_relative {
-    DEVINST_RELATIVE_PARENT,
-    DEVINST_RELATIVE_SIBLING,
-    DEVINST_RELATIVE_CHILD
-};
-
-#if defined(__MINGW64_VERSION_MAJOR) && __MINGW64_VERSION_MAJOR < 4
-__declspec(dllimport) BOOLEAN NTAPI HidD_GetSerialNumberString(HANDLE HidDeviceObject,
-                                                               PVOID Buffer, ULONG BufferLength);
-__declspec(dllimport) BOOLEAN NTAPI HidD_GetPreparsedData(HANDLE HidDeviceObject,
-                                                          PHIDP_PREPARSED_DATA *PreparsedData);
-__declspec(dllimport) BOOLEAN NTAPI HidD_FreePreparsedData(PHIDP_PREPARSED_DATA PreparsedData);
-#endif
-
-#define MAX_USB_DEPTH 8
-#define MONITOR_CLASS_NAME "hs_monitor"
-
-static const struct setup_class setup_classes[] = {
-    {"Ports",    HS_DEVICE_TYPE_SERIAL},
-    {"HIDClass", HS_DEVICE_TYPE_HID}
-};
-
-static volatile LONG controllers_lock_setup;
-static CRITICAL_SECTION controllers_lock;
-static char *controllers[32];
-static unsigned int controllers_count;
-
-static bool make_device_cursor(DEVINST inst, struct device_cursor *new_cursor)
-{
-    CONFIGRET cret;
-
-    new_cursor->inst = inst;
-    cret = CM_Get_Device_ID(inst, new_cursor->id, sizeof(new_cursor->id), 0);
-    if (cret != CR_SUCCESS) {
-        hs_log(HS_LOG_WARNING, "CM_Get_Device_ID() failed for instance 0x%lx: 0x%lx", inst, cret);
-        return false;
-    }
-
-    return true;
-}
-
-static bool make_relative_cursor(struct device_cursor *cursor,
-                                 enum device_cursor_relative relative,
-                                 struct device_cursor *new_cursor)
-{
-    DEVINST new_inst;
-    CONFIGRET cret = 0xFFFFFFFF;
-
-    switch (relative) {
-        case DEVINST_RELATIVE_PARENT: {
-            cret = CM_Get_Parent(&new_inst, cursor->inst, 0);
-            if (cret != CR_SUCCESS) {
-                hs_log(HS_LOG_DEBUG, "Cannot get parent of device '%s': 0x%lx", cursor->id, cret);
-                return false;
-            }
-        } break;
-
-        case DEVINST_RELATIVE_CHILD: {
-            cret = CM_Get_Child(&new_inst, cursor->inst, 0);
-            if (cret != CR_SUCCESS) {
-                hs_log(HS_LOG_DEBUG, "Cannot get child of device '%s': 0x%lx", cursor->id, cret);
-                return false;
-            }
-        } break;
-
-        case DEVINST_RELATIVE_SIBLING: {
-            cret = CM_Get_Sibling(&new_inst, cursor->inst, 0);
-            if (cret != CR_SUCCESS) {
-                hs_log(HS_LOG_DEBUG, "Cannot get sibling of device '%s': 0x%lx", cursor->id, cret);
-                return false;
-            }
-        } break;
-    }
-    assert(cret != 0xFFFFFFFF);
-
-    return make_device_cursor(new_inst, new_cursor);
-}
-
-static uint8_t find_controller(const char *id)
-{
-    for (unsigned int i = 0; i < controllers_count; i++) {
-        if (strcmp(controllers[i], id) == 0)
-            return (uint8_t)(i + 1);
-    }
-
-    return 0;
-}
-
-static int build_device_path(const char *id, const GUID *guid, char **rpath)
-{
-    char *path, *ptr;
-
-    path = (char *)malloc(4 + strlen(id) + 41);
-    if (!path)
-        return hs_error(HS_ERROR_MEMORY, NULL);
-
-    strcpy(path, "\\\\.\\");
-    ptr = path + 4;
-
-    while (*id) {
-        if (*id == '\\') {
-            *ptr++ = '#';
-            id++;
-        } else {
-            *ptr++ = *id++;
-        }
-    }
-
-    sprintf(ptr, "#{%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}",
-            guid->Data1, guid->Data2, guid->Data3, guid->Data4[0], guid->Data4[1],
-            guid->Data4[2], guid->Data4[3], guid->Data4[4], guid->Data4[5], guid->Data4[6], guid->Data4[7]);
-
-    *rpath = path;
-    return 0;
-}
-
-static int build_location_string(uint8_t ports[], unsigned int depth, char **rpath)
-{
-    char buf[256];
-    char *ptr;
-    size_t size;
-    char *path;
-    int r;
-
-    ptr = buf;
-    size = sizeof(buf);
-
-    ptr = strcpy(buf, "usb");
-    ptr = buf + 3;
-    size -= (size_t)(ptr - buf);
-
-    for (size_t i = 0; i < depth; i++) {
-        r = snprintf(ptr, size, "-%hhu", ports[i]);
-        assert(r >= 2 && (size_t)r < size);
-
-        ptr += r;
-        size -= (size_t)r;
-    }
-
-    path = strdup(buf);
-    if (!path)
-        return hs_error(HS_ERROR_MEMORY, NULL);
-
-    *rpath = path;
-    return 0;
-}
-
-static int wide_to_cstring(const wchar_t *wide, size_t size, char **rs)
-{
-    wchar_t *tmp = NULL;
-    char *s = NULL;
-    int len, r;
-
-    tmp = (wchar_t *)calloc(1, size + sizeof(wchar_t));
-    if (!tmp) {
-        r = hs_error(HS_ERROR_MEMORY, NULL);
-        goto cleanup;
-    }
-
-    memcpy(tmp, wide, size);
-
-    len = WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, tmp, -1, NULL, 0, NULL, NULL);
-    if (!len) {
-        r = hs_error(HS_ERROR_SYSTEM, "Failed to convert UTF-16 string to local codepage: %s",
-                     hs_win32_strerror(0));
-        goto cleanup;
-    }
-
-    s = (char *)malloc((size_t)len);
-    if (!s) {
-        r = hs_error(HS_ERROR_MEMORY, NULL);
-        goto cleanup;
-    }
-
-    len = WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, tmp, -1, s, len, NULL, NULL);
-    if (!len) {
-        r = hs_error(HS_ERROR_SYSTEM, "Failed to convert UTF-16 string to local codepage: %s",
-                     hs_win32_strerror(0));
-        goto cleanup;
-    }
-
-    *rs = s;
-    s = NULL;
-
-    r = 0;
-cleanup:
-    free(s);
-    free(tmp);
-    return r;
-}
-
-static int get_port_driverkey(HANDLE hub, uint8_t port, char **rkey)
-{
-    DWORD len;
-    USB_NODE_CONNECTION_INFORMATION_EX *node;
-    USB_NODE_CONNECTION_DRIVERKEY_NAME pseudo = {0};
-    USB_NODE_CONNECTION_DRIVERKEY_NAME *wide = NULL;
-    BOOL success;
-    int r;
-
-    len = sizeof(node) + (sizeof(USB_PIPE_INFO) * 30);
-    node = (USB_NODE_CONNECTION_INFORMATION_EX *)calloc(1, len);
-    if (!node) {
-        r = hs_error(HS_ERROR_MEMORY, NULL);
-        goto cleanup;
-    }
-
-    node->ConnectionIndex = port;
-    pseudo.ConnectionIndex = port;
-
-    success = DeviceIoControl(hub, IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX, node, len,
-                              node, len, &len, NULL);
-    if (!success) {
-        hs_log(HS_LOG_WARNING, "DeviceIoControl(IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX) failed");
-        r = 0;
-        goto cleanup;
-    }
-
-    if (node->ConnectionStatus != DeviceConnected) {
-        r = 0;
-        goto cleanup;
-    }
-
-    success = DeviceIoControl(hub, IOCTL_USB_GET_NODE_CONNECTION_DRIVERKEY_NAME, &pseudo, sizeof(pseudo),
-                              &pseudo, sizeof(pseudo), &len, NULL);
-    if (!success) {
-        hs_log(HS_LOG_WARNING, "DeviceIoControl(IOCTL_USB_GET_NODE_CONNECTION_DRIVERKEY_NAME) failed");
-        r = 0;
-        goto cleanup;
-    }
-
-    wide = (USB_NODE_CONNECTION_DRIVERKEY_NAME *)calloc(1, pseudo.ActualLength);
-    if (!wide) {
-        r = hs_error(HS_ERROR_MEMORY, NULL);
-        goto cleanup;
-    }
-
-    wide->ConnectionIndex = port;
-
-    success = DeviceIoControl(hub, IOCTL_USB_GET_NODE_CONNECTION_DRIVERKEY_NAME, wide, pseudo.ActualLength,
-                              wide, pseudo.ActualLength, &len, NULL);
-    if (!success) {
-        hs_log(HS_LOG_WARNING, "DeviceIoControl(IOCTL_USB_GET_NODE_CONNECTION_DRIVERKEY_NAME) failed");
-        r = 0;
-        goto cleanup;
-    }
-
-    r = wide_to_cstring(wide->DriverKeyName, len - sizeof(pseudo) + 1, rkey);
-    if (r < 0)
-        goto cleanup;
-
-    r = 1;
-cleanup:
-    free(wide);
-    free(node);
-    return r;
-}
-
-static int find_device_port_ioctl(const char *hub_id, const char *child_key)
-{
-    char *path = NULL;
-    HANDLE h = NULL;
-    USB_NODE_INFORMATION node;
-    DWORD len;
-    BOOL success;
-    int r;
-
-    r = build_device_path(hub_id, &GUID_DEVINTERFACE_USB_HUB, &path);
-    if (r < 0)
-        goto cleanup;
-
-    h = CreateFile(path, GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
-    if (h == INVALID_HANDLE_VALUE) {
-        hs_log(HS_LOG_DEBUG, "Failed to open USB hub '%s': %s", path, hs_win32_strerror(0));
-        r = 0;
-        goto cleanup;
-    }
-
-    hs_log(HS_LOG_DEBUG, "Asking HUB at '%s' for port information (legacy code path)", path);
-    success = DeviceIoControl(h, IOCTL_USB_GET_NODE_INFORMATION, NULL, 0, &node, sizeof(node),
-                              &len, NULL);
-    if (!success) {
-        hs_log(HS_LOG_DEBUG, "DeviceIoControl(IOCTL_USB_GET_NODE_INFORMATION) failed");
-        r = 0;
-        goto cleanup;
-    }
-
-    for (uint8_t port = 1; port <= node.u.HubInformation.HubDescriptor.bNumberOfPorts; port++) {
-        char *key = NULL;
-
-        r = get_port_driverkey(h, port, &key);
-        if (r < 0)
-            goto cleanup;
-        if (!r)
-            continue;
-
-        if (strcmp(key, child_key) == 0) {
-            free(key);
-
-            r = port;
-            break;
-        } else {
-            free(key);
-        }
-    }
-
-cleanup:
-    if (h)
-        CloseHandle(h);
-    free(path);
-    return r;
-}
-
-static bool is_root_usb_controller(const char *id)
-{
-    static const char *const root_needles[] = {
-        "ROOT_HUB",
-        "VMUSB\\HUB" // Microsoft Virtual PC
-    };
-
-    for (size_t i = 0; i < _HS_COUNTOF(root_needles); i++) {
-        if (strstr(id, root_needles[i]))
-            return true;
-    }
-    return false;
-}
-
-static int resolve_usb_location_ioctl(struct device_cursor usb_cursor, uint8_t ports[],
-                                      struct device_cursor *roothub_cursor)
-{
-    unsigned int depth;
-
-    depth = 0;
-    do {
-        struct device_cursor parent_cursor;
-        char child_key[256];
-        DWORD child_key_len;
-        CONFIGRET cret;
-        int r;
-
-        if (!make_relative_cursor(&usb_cursor, DEVINST_RELATIVE_PARENT, &parent_cursor))
-            return 0;
-
-        child_key_len = sizeof(child_key);
-        cret = CM_Get_DevNode_Registry_Property(usb_cursor.inst, CM_DRP_DRIVER, NULL,
-                                                child_key, &child_key_len, 0);
-        if (cret != CR_SUCCESS) {
-            hs_log(HS_LOG_WARNING, "Failed to get device driver key: 0x%lx", cret);
-            return 0;
-        }
-        r = find_device_port_ioctl(parent_cursor.id, child_key);
-        if (r <= 0)
-            return r;
-        ports[depth] = (uint8_t)r;
-        hs_log(HS_LOG_DEBUG, "Found port number of '%s': %u", usb_cursor.id, ports[depth]);
-        depth++;
-
-        // We need place for the root hub index
-        if (depth == MAX_USB_DEPTH) {
-            hs_log(HS_LOG_WARNING, "Excessive USB location depth, ignoring device");
-            return 0;
-        }
-
-        usb_cursor = parent_cursor;
-    } while (!is_root_usb_controller(usb_cursor.id));
-
-    *roothub_cursor = usb_cursor;
-    return (int)depth;
-}
-
-static int resolve_usb_location_cfgmgr(struct device_cursor usb_cursor, uint8_t ports[],
-                                       struct device_cursor *roothub_cursor)
-{
-    unsigned int depth;
-
-    depth = 0;
-    do {
-        char location_buf[256];
-        DWORD location_len;
-        unsigned int location_port;
-        CONFIGRET cret;
-
-        // Extract port from CM_DRP_LOCATION_INFORMATION (Vista and later versions)
-        location_len = sizeof(location_buf);
-        cret = CM_Get_DevNode_Registry_Property(usb_cursor.inst, CM_DRP_LOCATION_INFORMATION,
-                                                NULL, location_buf, &location_len, 0);
-        if (cret != CR_SUCCESS) {
-            hs_log(HS_LOG_DEBUG, "No location information on this device node");
-            return 0;
-        }
-        location_port = 0;
-        sscanf(location_buf, "Port_#%04u", &location_port);
-        if (!location_port)
-            return 0;
-        hs_log(HS_LOG_DEBUG, "Found port number of '%s': %u", usb_cursor.id, location_port);
-        ports[depth++] = (uint8_t)location_port;
-
-        // We need place for the root hub index
-        if (depth == MAX_USB_DEPTH) {
-            hs_log(HS_LOG_WARNING, "Excessive USB location depth, ignoring device");
-            return 0;
-        }
-
-        if (!make_relative_cursor(&usb_cursor, DEVINST_RELATIVE_PARENT, &usb_cursor))
-            return 0;
-    } while (!is_root_usb_controller(usb_cursor.id));
-
-    *roothub_cursor = usb_cursor;
-    return (int)depth;
-}
-
-static int find_device_location(const struct device_cursor *dev_cursor, uint8_t ports[])
-{
-    struct device_cursor usb_cursor;
-    struct device_cursor roothub_cursor;
-    int depth;
-
-    // Find the USB device instance
-    usb_cursor = *dev_cursor;
-    while (strncmp(usb_cursor.id, "USB\\", 4) != 0 || strstr(usb_cursor.id, "&MI_")) {
-        if (!make_relative_cursor(&usb_cursor, DEVINST_RELATIVE_PARENT, &usb_cursor))
-            return 0;
-    }
-
-    /* Browse the USB tree to resolve USB ports. Try the CfgMgr method first, only
-       available on Windows Vista and later versions. It may also fail with third-party
-       USB controller drivers, typically USB 3.0 host controllers before Windows 10. */
-    depth = 0;
-    if (!getenv("LIBHS_WIN32_FORCE_XP_LOCATION_CODE")) {
-        depth = resolve_usb_location_cfgmgr(usb_cursor, ports, &roothub_cursor);
-        if (depth < 0)
-            return depth;
-    }
-    if (!depth) {
-        hs_log(HS_LOG_DEBUG, "Using legacy code for location of '%s'", dev_cursor->id);
-        depth = resolve_usb_location_ioctl(usb_cursor, ports, &roothub_cursor);
-        if (depth < 0)
-            return depth;
-    }
-    if (!depth) {
-        hs_log(HS_LOG_DEBUG, "Cannot resolve USB location for '%s'", dev_cursor->id);
-        return 0;
-    }
-
-    // Resolve the USB controller ID
-    ports[depth] = find_controller(roothub_cursor.id);
-    if (!ports[depth]) {
-        hs_log(HS_LOG_WARNING, "Unknown USB host controller '%s'", roothub_cursor.id);
-        return 0;
-    }
-    hs_log(HS_LOG_DEBUG, "Found controller ID for '%s': %u", roothub_cursor.id, ports[depth]);
-    depth++;
-
-    // The ports are in the wrong order
-    for (int i = 0; i < depth / 2; i++) {
-        uint8_t tmp = ports[i];
-        ports[i] = ports[depth - i - 1];
-        ports[depth - i - 1] = tmp;
-    }
-
-    return depth;
-}
-
-static int read_hid_properties(hs_device *dev, const USB_DEVICE_DESCRIPTOR *desc)
-{
-    HANDLE h = NULL;
-    int r;
-
-    h = CreateFile(dev->path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
-    if (h == INVALID_HANDLE_VALUE) {
-        hs_log(HS_LOG_WARNING, "Cannot open HID device '%s': %s", dev->path, hs_win32_strerror(0));
-        r = 0;
-        goto cleanup;
-    }
-
-#define READ_HID_PROPERTY(index, func, dest) \
-        if (index) { \
-            wchar_t wbuf[256]; \
-            BOOL bret; \
-            \
-            bret = func(h, wbuf, sizeof(wbuf)); \
-            if (bret) { \
-                wbuf[_HS_COUNTOF(wbuf) - 1] = 0; \
-                r = wide_to_cstring(wbuf, wcslen(wbuf) * sizeof(wchar_t), (dest)); \
-                if (r < 0) \
-                    goto cleanup; \
-            } else { \
-                hs_log(HS_LOG_WARNING, "Function %s() failed despite non-zero string index", #func); \
-            } \
-        }
-
-    READ_HID_PROPERTY(desc->iManufacturer, HidD_GetManufacturerString, &dev->manufacturer_string);
-    READ_HID_PROPERTY(desc->iProduct, HidD_GetProductString, &dev->product_string);
-    READ_HID_PROPERTY(desc->iSerialNumber, HidD_GetSerialNumberString, &dev->serial_number_string);
-
-#undef READ_HID_PROPERTY
-
-    {
-        // semi-hidden Hungarian pointers? Really , Microsoft?
-        PHIDP_PREPARSED_DATA pp;
-        HIDP_CAPS caps;
-        LONG lret;
-
-        lret = HidD_GetPreparsedData(h, &pp);
-        if (!lret) {
-            hs_log(HS_LOG_WARNING, "HidD_GetPreparsedData() failed on '%s", dev->path);
-            r = 0;
-            goto cleanup;
-        }
-        lret = HidP_GetCaps(pp, &caps);
-        HidD_FreePreparsedData(pp);
-        if (lret != HIDP_STATUS_SUCCESS) {
-            hs_log(HS_LOG_WARNING, "Invalid HID descriptor from '%s", dev->path);
-            r = 0;
-            goto cleanup;
-        }
-
-        dev->u.hid.usage_page = caps.UsagePage;
-        dev->u.hid.usage = caps.Usage;
-        dev->u.hid.input_report_len = caps.InputReportByteLength;
-    }
-
-    r = 1;
-cleanup:
-    if (h)
-        CloseHandle(h);
-    return r;
-}
-
-static int get_string_descriptor(HANDLE hub, uint8_t port, uint8_t index, char **rs)
-{
-    // A bit ugly, but using USB_DESCRIPTOR_REQUEST directly triggers a C2229 on MSVC
-    struct {
-        // USB_DESCRIPTOR_REQUEST
-        struct {
-            ULONG  ConnectionIndex;
-            struct {
-                UCHAR bmRequest;
-                UCHAR bRequest;
-                USHORT wValue;
-                USHORT wIndex;
-                USHORT wLength;
-            } SetupPacket;
-        } req;
-
-        // Filled by DeviceIoControl
-        struct {
-            UCHAR bLength;
-            UCHAR bDescriptorType;
-            WCHAR bString[MAXIMUM_USB_STRING_LENGTH];
-        } desc;
-    } rq;
-    DWORD desc_len = 0;
-    char *s;
-    BOOL success;
-    int r;
-
-    memset(&rq, 0, sizeof(rq));
-    rq.req.ConnectionIndex = port;
-    rq.req.SetupPacket.wValue = (USHORT)((USB_STRING_DESCRIPTOR_TYPE << 8) | index);
-    rq.req.SetupPacket.wIndex = 0x409;
-    rq.req.SetupPacket.wLength = sizeof(rq.desc);
-
-    success = DeviceIoControl(hub, IOCTL_USB_GET_DESCRIPTOR_FROM_NODE_CONNECTION, &rq,
-                              sizeof(rq), &rq, sizeof(rq), &desc_len, NULL);
-    if (!success || desc_len < 2 || rq.desc.bDescriptorType != USB_STRING_DESCRIPTOR_TYPE ||
-            rq.desc.bLength != desc_len - sizeof(rq.req) || rq.desc.bLength % 2 != 0) {
-        hs_log(HS_LOG_DEBUG, "Invalid string descriptor %u", index);
-        return 0;
-    }
-
-    r = wide_to_cstring(rq.desc.bString, desc_len - sizeof(USB_DESCRIPTOR_REQUEST), &s);
-    if (r < 0)
-        return r;
-
-    *rs = s;
-    return 0;
-}
-
-static int read_device_properties(hs_device *dev, const struct device_cursor *dev_cursor, uint8_t port)
-{
-    struct device_cursor intf_cursor, usb_cursor, hub_cursor;
-    unsigned int vid, pid, iface_number;
-    char *path = NULL;
-    HANDLE hub = NULL;
-    DWORD len;
-    USB_NODE_CONNECTION_INFORMATION_EX *node = NULL;
-    BOOL success;
-    int r;
-
-    // Find relevant device instances: interface, device, HUB
-    intf_cursor = *dev_cursor;
-    while (strncmp(intf_cursor.id, "USB\\", 4) != 0) {
-        if (!make_relative_cursor(&intf_cursor, DEVINST_RELATIVE_PARENT, &intf_cursor)) {
-            r = 0;
-            goto cleanup;
-        }
-    }
-    if (strstr(intf_cursor.id, "&MI_")) {
-        if (!make_relative_cursor(&intf_cursor, DEVINST_RELATIVE_PARENT, &usb_cursor)) {
-            r = 0;
-            goto cleanup;
-        }
-    } else {
-        usb_cursor = intf_cursor;
-    }
-    if (!make_relative_cursor(&usb_cursor, DEVINST_RELATIVE_PARENT, &hub_cursor)) {
-        r = 0;
-        goto cleanup;
-    }
-
-    // Make device key (used for removal, among other things)
-    dev->key = strdup(usb_cursor.id);
-    if (!dev->key) {
-        r = hs_error(HS_ERROR_MEMORY, NULL);
-        goto cleanup;
-    }
-
-    /* h and hh type modifier characters are not known to msvcrt, and MinGW issues warnings
-       if we try to use them. Use temporary unsigned int variables to get around that. */
-    iface_number = 0;
-    r = sscanf(intf_cursor.id, "USB\\VID_%04x&PID_%04x&MI_%02u", &vid, &pid, &iface_number);
-    if (r < 2) {
-        hs_log(HS_LOG_WARNING, "Failed to parse USB properties from '%s'", intf_cursor.id);
-        r = 0;
-        goto cleanup;
-    }
-    dev->vid = (uint16_t)vid;
-    dev->pid = (uint16_t)pid;
-    dev->iface_number = (uint8_t)iface_number;
-
-    r = build_device_path(hub_cursor.id, &GUID_DEVINTERFACE_USB_HUB, &path);
-    if (r < 0)
-        goto cleanup;
-
-    hub = CreateFile(path, GENERIC_WRITE, FILE_SHARE_WRITE | FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    if (hub == INVALID_HANDLE_VALUE) {
-        hs_log(HS_LOG_DEBUG, "Cannot open parent hub device at '%s', ignoring device properties for '%s'",
-               path, dev_cursor->id);
-        r = 1;
-        goto cleanup;
-    }
-
-    len = sizeof(node) + (sizeof(USB_PIPE_INFO) * 30);
-    node = (USB_NODE_CONNECTION_INFORMATION_EX *)calloc(1, len);
-    if (!node) {
-        r = hs_error(HS_ERROR_MEMORY, NULL);
-        goto cleanup;
-    }
-
-    node->ConnectionIndex = port;
-    success = DeviceIoControl(hub, IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX, node, len,
-                              node, len, &len, NULL);
-    if (!success) {
-        hs_log(HS_LOG_DEBUG, "Failed to interrogate hub device at '%s' for device '%s'",
-               path, dev_cursor->id);
-        r = 1;
-        goto cleanup;
-    }
-
-    // Get additional properties
-    dev->bcd_device = node->DeviceDescriptor.bcdDevice;
-
-    /* Descriptor requests to USB devices underlying HID devices fail most (all?) of the time,
-       so we need a different technique here. We still need the device descriptor because the
-       HidD_GetXString() functions sometime return garbage (at least on XP) when the string
-       index is 0. */
-    if (dev->type == HS_DEVICE_TYPE_HID) {
-        r = read_hid_properties(dev, &node->DeviceDescriptor);
-        goto cleanup;
-    }
-
-#define READ_STRING_DESCRIPTOR(index, var) \
-        if (index) { \
-            r = get_string_descriptor(hub, port, (index), (var)); \
-            if (r < 0) \
-                goto cleanup; \
-        }
-
-    READ_STRING_DESCRIPTOR(node->DeviceDescriptor.iManufacturer, &dev->manufacturer_string);
-    READ_STRING_DESCRIPTOR(node->DeviceDescriptor.iProduct, &dev->product_string);
-    READ_STRING_DESCRIPTOR(node->DeviceDescriptor.iSerialNumber, &dev->serial_number_string);
-
-#undef READ_STRING_DESCRIPTOR
-
-    r = 1;
-cleanup:
-    free(node);
-    if (hub)
-        CloseHandle(hub);
-    free(path);
-    return r;
-}
-
-static int get_device_comport(DEVINST inst, char **rnode)
-{
-    HKEY key;
-    char buf[32];
-    DWORD len;
-    char *node;
-    CONFIGRET cret;
-    LONG ret;
-    int r;
-
-    cret = CM_Open_DevNode_Key(inst, KEY_READ, 0, RegDisposition_OpenExisting, &key, CM_REGISTRY_HARDWARE);
-    if (cret != CR_SUCCESS) {
-        hs_log(HS_LOG_WARNING, "CM_Open_DevNode_Key() failed: 0x%lu", cret);
-        return 0;
-    }
-
-    len = (DWORD)sizeof(buf);
-    ret = RegGetValue(key, "", "PortName", RRF_RT_REG_SZ, NULL, (BYTE *)buf, &len);
-    RegCloseKey(key);
-    if (ret != ERROR_SUCCESS) {
-        if (ret != ERROR_FILE_NOT_FOUND)
-            hs_log(HS_LOG_WARNING, "RegQueryValue() failed: %ld", ret);
-        return 0;
-    }
-    len--;
-
-    // You need the \\.\ prefix to open COM ports beyond COM9
-    r = _hs_asprintf(&node, "%s%s", len > 4 ? "\\\\.\\" : "", buf);
-    if (r < 0)
-        return hs_error(HS_ERROR_MEMORY, NULL);
-
-    *rnode = node;
-    return 1;
-}
-
-static int find_device_node(hs_device *dev, const struct device_cursor *dev_cursor)
-{
-    int r;
-
-    /* GUID_DEVINTERFACE_COMPORT only works for real COM ports... Haven't found any way to
-       list virtual (USB) serial device interfaces, so instead list USB devices and consider
-       them serial if registry key "PortName" is available (and use its value as device node). */
-    if (strncmp(dev_cursor->id, "USB\\", 4) == 0 || strncmp(dev_cursor->id, "FTDIBUS\\", 8) == 0) {
-        r = get_device_comport(dev_cursor->inst, &dev->path);
-        if (!r) {
-            hs_log(HS_LOG_DEBUG, "Device '%s' has no 'PortName' registry property", dev_cursor->id);
-            return r;
-        }
-        if (r < 0)
-            return r;
-
-        dev->type = HS_DEVICE_TYPE_SERIAL;
-    } else if (strncmp(dev_cursor->id, "HID\\", 4) == 0) {
-        static GUID hid_interface_guid;
-        if (!hid_interface_guid.Data1)
-            HidD_GetHidGuid(&hid_interface_guid);
-
-        r = build_device_path(dev_cursor->id, &hid_interface_guid, &dev->path);
-        if (r < 0)
-            return r;
-
-        dev->type = HS_DEVICE_TYPE_HID;
-    } else {
-        hs_log(HS_LOG_DEBUG, "Unknown device type for '%s'", dev_cursor->id);
-        return 0;
-    }
-
-    return 1;
-}
-
-static int process_win32_device(DEVINST inst, hs_device **rdev)
-{
-    struct device_cursor dev_cursor;
-    hs_device *dev;
-    uint8_t ports[MAX_USB_DEPTH];
-    unsigned int depth;
-    int r;
-
-    if (!make_device_cursor(inst, &dev_cursor)) {
-        r = 0;
-        goto cleanup;
-    }
-
-    dev = (hs_device *)calloc(1, sizeof(*dev));
-    if (!dev) {
-        r = hs_error(HS_ERROR_MEMORY, NULL);
-        goto cleanup;
-    }
-    dev->refcount = 1;
-    dev->status = HS_DEVICE_STATUS_ONLINE;
-
-    // HID devices can have multiple collections for each interface, ignore them
-    if (strncmp(dev_cursor.id, "HID\\", 4) == 0) {
-        const char *ptr = strstr(dev_cursor.id, "&COL");
-        if (ptr && strncmp(ptr, "&COL01\\",  7) != 0) {
-            hs_log(HS_LOG_DEBUG, "Ignoring duplicate HID collection device '%s'", dev_cursor.id);
-            r = 0;
-            goto cleanup;
-        }
-    }
-
-    hs_log(HS_LOG_DEBUG, "Examining device node '%s'", dev_cursor.id);
-
-    // Ignore composite devices
-    {
-        char class[512];
-        DWORD class_len;
-        CONFIGRET cret;
-
-        class_len = sizeof(class);
-        cret = CM_Get_DevNode_Registry_Property(inst, CM_DRP_CLASSGUID, NULL, class, &class_len, 0);
-        if (cret != CR_SUCCESS) {
-            hs_log(HS_LOG_WARNING, "Failed to get device class GUID: 0x%lx", cret);
-            r = 0;
-            goto cleanup;
-        }
-
-        if (!strcasecmp(class, "{36fc9e60-c465-11cf-8056-444553540000}")) {
-            hs_log(HS_LOG_DEBUG, "Ignoring composite device");
-            r = 0;
-            goto cleanup;
-        }
-    }
-
-    r = find_device_node(dev, &dev_cursor);
-    if (r <= 0)
-        goto cleanup;
-
-    r = find_device_location(&dev_cursor, ports);
-    if (r <= 0)
-        goto cleanup;
-    depth = (unsigned int)r;
-
-    r = read_device_properties(dev, &dev_cursor, ports[depth - 1]);
-    if (r <= 0)
-        goto cleanup;
-
-    r = build_location_string(ports, depth, &dev->location);
-    if (r < 0)
-        goto cleanup;
-
-    *rdev = dev;
-    dev = NULL;
-    r = 1;
-
-cleanup:
-    hs_device_unref(dev);
-    return r;
-}
-
-static void free_controllers(void)
-{
-    for (unsigned int i = 0; i < controllers_count; i++)
-        free(controllers[i]);
-    DeleteCriticalSection(&controllers_lock);
-}
-
-static int populate_controllers(void)
-{
-    HDEVINFO set = NULL;
-    SP_DEVINFO_DATA info;
-    int r;
-
-    if (controllers_count)
-        return 0;
-
-    if (controllers_lock_setup != 2) {
-        if (!InterlockedCompareExchange(&controllers_lock_setup, 1, 0)) {
-            InitializeCriticalSection(&controllers_lock);
-            atexit(free_controllers);
-            controllers_lock_setup = 2;
-        } else {
-            while (controllers_lock_setup != 2)
-                continue;
-        }
-    }
-
-    EnterCriticalSection(&controllers_lock);
-
-    if (controllers_count) {
-        r = 0;
-        goto cleanup;
-    }
-
-    hs_log(HS_LOG_DEBUG, "Listing USB host controllers and root hubs");
-
-    set = SetupDiGetClassDevs(&GUID_DEVINTERFACE_USB_HOST_CONTROLLER, NULL, NULL,
-                              DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
-    if (!set) {
-        r = hs_error(HS_ERROR_SYSTEM, "SetupDiGetClassDevs() failed: %s", hs_win32_strerror(0));
-        goto cleanup;
-    }
-
-    info.cbSize = sizeof(info);
-    for (DWORD i = 0; SetupDiEnumDeviceInfo(set, i, &info); i++) {
-        struct device_cursor cursor;
-
-        if (controllers_count == _HS_COUNTOF(controllers)) {
-            hs_log(HS_LOG_WARNING, "Reached maximum controller ID %d, ignoring", UINT8_MAX);
-            break;
-        }
-
-        if (!make_device_cursor(info.DevInst, &cursor))
-            continue;
-        if (!make_relative_cursor(&cursor, DEVINST_RELATIVE_CHILD, &cursor))
-            continue;
-        if (!is_root_usb_controller(cursor.id)) {
-            hs_log(HS_LOG_WARNING, "Expected root hub device at '%s'", cursor.id);
-            continue;
-        }
-
-        controllers[controllers_count] = strdup(cursor.id);
-        if (!controllers[controllers_count]) {
-            r = hs_error(HS_ERROR_MEMORY, NULL);
-            goto cleanup;
-        }
-        hs_log(HS_LOG_DEBUG, "Found root USB hub '%s' with ID %u", cursor.id, controllers_count);
-        controllers_count++;
-    }
-
-    r = 0;
-cleanup:
-    LeaveCriticalSection(&controllers_lock);
-    if (set)
-        SetupDiDestroyDeviceInfoList(set);
-    return r;
-}
-
-static int enumerate_setup_class(const GUID *guid, const _hs_match_helper *match_helper,
-                                 hs_enumerate_func *f, void *udata)
-{
-    HDEVINFO set = NULL;
-    SP_DEVINFO_DATA info;
-    hs_device *dev = NULL;
-    int r;
-
-    set = SetupDiGetClassDevs(guid, NULL, NULL, DIGCF_PRESENT);
-    if (!set) {
-        r = hs_error(HS_ERROR_SYSTEM, "SetupDiGetClassDevs() failed: %s", hs_win32_strerror(0));
-        goto cleanup;
-    }
-
-    info.cbSize = sizeof(info);
-    for (DWORD i = 0; SetupDiEnumDeviceInfo(set, i, &info); i++) {
-        r = process_win32_device(info.DevInst, &dev);
-        if (r < 0)
-            goto cleanup;
-        if (!r)
-            continue;
-
-        if (_hs_match_helper_match(match_helper, dev, &dev->match_udata)) {
-            r = (*f)(dev, udata);
-            hs_device_unref(dev);
-            if (r)
-                goto cleanup;
-        } else {
-            hs_device_unref(dev);
-        }
-    }
-
-    r = 0;
-cleanup:
-    if (set)
-        SetupDiDestroyDeviceInfoList(set);
-    return r;
-}
-
-int enumerate(_hs_match_helper *match_helper, hs_enumerate_func *f, void *udata)
-{
-    int r;
-
-    r = populate_controllers();
-    if (r < 0)
-        return r;
-
-    for (unsigned int i = 0; i < _HS_COUNTOF(setup_classes); i++) {
-        if (_hs_match_helper_has_type(match_helper, setup_classes[i].type)) {
-            GUID guids[8];
-            DWORD guids_count;
-            BOOL success;
-
-            success = SetupDiClassGuidsFromName(setup_classes[i].name, guids, _HS_COUNTOF(guids),
-                                                &guids_count);
-            if (!success)
-                return hs_error(HS_ERROR_SYSTEM, "SetupDiClassGuidsFromName('%s') failed: %s",
-                                setup_classes[i].name, hs_win32_strerror(0));
-
-            for (unsigned int j = 0; j < guids_count; j++) {
-                r = enumerate_setup_class(&guids[j], match_helper, f, udata);
-                if (r)
-                    return r;
-            }
-        }
-    }
-
-    return 0;
-}
-
-struct enumerate_enumerate_context {
-    hs_enumerate_func *f;
-    void *udata;
-};
-
-static int enumerate_enumerate_callback(hs_device *dev, void *udata)
-{
-    struct enumerate_enumerate_context *ctx = (struct enumerate_enumerate_context *)udata;
-
-    _hs_device_log(dev, "Enumerate");
-    return (*ctx->f)(dev, ctx->udata);
-}
-
-int hs_enumerate(const hs_match_spec *matches, unsigned int count, hs_enumerate_func *f, void *udata)
-{
-    assert(f);
-
-    _hs_match_helper match_helper = {0};
-    struct enumerate_enumerate_context ctx;
-    int r;
-
-    r = _hs_match_helper_init(&match_helper, matches, count);
-    if (r < 0)
-        return r;
-
-    ctx.f = f;
-    ctx.udata = udata;
-
-    r = enumerate(&match_helper, enumerate_enumerate_callback, &ctx);
-
-    _hs_match_helper_release(&match_helper);
-    return r;
-}
-
-static int post_event(hs_monitor *monitor, enum event_type event_type, const char *id)
-{
-    size_t id_len;
-    struct event *event;
-    int r;
-
-    /* Extract the device instance ID part.
-       - in: \\?\USB#Vid_2341&Pid_0042#85336303532351101252#{a5dcbf10-6530-11d2-901f-00c04fb951ed}
-       - out: USB#Vid_2341&Pid_0042#85336303532351101252
-       You may notice that paths from RegisterDeviceNotification() seem to start with '\\?\',
-       which according to MSDN is the file namespace, not the device namespace '\\.\'. Oh well. */
-    if (strncmp(id, "\\\\?\\", 4) == 0
-            || strncmp(id, "\\\\.\\", 4) == 0
-            || strncmp(id, "##.#", 4) == 0
-            || strncmp(id, "##?#", 4) == 0)
-        id += 4;
-    id_len = strlen(id);
-    if (id_len >= 39 && id[id_len - 39] == '#' && id[id_len - 38] == '{' && id[id_len - 1] == '}')
-        id_len -= 39;
-
-    if (id_len >= sizeof(event->device_key)) {
-        hs_log(HS_LOG_WARNING, "Device instance ID string '%s' is too long, ignoring", id);
-        return 0;
-    }
-    r = _hs_array_grow(&monitor->thread_events, 1);
-    if (r < 0)
-        return r;
-    event = &monitor->thread_events.values[monitor->thread_events.count];
-    event->type = event_type;
-    memcpy(event->device_key, id, id_len);
-    event->device_key[id_len] = 0;
-    monitor->thread_events.count++;
-
-    /* Normalize device instance ID, uppercase and replace '#' with '\'. Could not do it on msg,
-       Windows may not like it. Maybe, not sure so don't try. */
-    for (char *ptr = event->device_key; *ptr; ptr++) {
-        if (*ptr == '#') {
-            *ptr = '\\';
-        } else if (*ptr >= 97 && *ptr <= 122) {
-            *ptr = (char)(*ptr - 32);
-        }
-    }
-
-    /* On Windows 7 (and maybe Windows 8), we don't get notifications for individual
-       interfaces in composite devices. We need to search for them. */
-    if (event_type == DEVICE_EVENT_ADDED && hs_win32_version() < HS_WIN32_VERSION_10) {
-        DEVINST inst;
-        CONFIGRET cret;
-
-        cret = CM_Locate_DevNode(&inst, (DEVINSTID)event->device_key, CM_LOCATE_DEVNODE_NORMAL);
-        if (cret != CR_SUCCESS) {
-            hs_log(HS_LOG_DEBUG, "Device node '%s' does not exist: 0x%lx", event->device_key, cret);
-            return 0;
-        }
-
-        struct device_cursor child_cursor;
-        if (!make_device_cursor(inst, &child_cursor))
-            return 0;
-        if (!make_relative_cursor(&child_cursor, DEVINST_RELATIVE_CHILD, &child_cursor))
-            return 0;
-
-        do {
-            r = post_event(monitor, DEVICE_EVENT_ADDED, child_cursor.id);
-            if (r < 0)
-                return r;
-        } while (make_relative_cursor(&child_cursor, DEVINST_RELATIVE_SIBLING, &child_cursor));
-    }
-
-    return 0;
-}
-
-static LRESULT __stdcall window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
-{
-    hs_monitor *monitor = (hs_monitor *)GetWindowLongPtr(hwnd, GWLP_USERDATA);
-    int r;
-
-    switch (msg) {
-        case WM_DEVICECHANGE: {
-            DEV_BROADCAST_DEVICEINTERFACE *msg2 = (DEV_BROADCAST_DEVICEINTERFACE *)lparam;
-
-            if (msg2->dbcc_devicetype != DBT_DEVTYP_DEVICEINTERFACE)
-                break;
-
-            r = 0;
-            switch (wparam) {
-                case DBT_DEVICEARRIVAL: {
-                    r = post_event(monitor, DEVICE_EVENT_ADDED, msg2->dbcc_name);
-                } break;
-
-                case DBT_DEVICEREMOVECOMPLETE: {
-                    r = post_event(monitor, DEVICE_EVENT_REMOVED, msg2->dbcc_name);
-                } break;
-            }
-
-            if (!r) {
-                UINT_PTR timer;
-
-                timer = SetTimer(hwnd, 1, 100, NULL);
-                if (!timer)
-                    r = hs_error(HS_ERROR_SYSTEM, "SetTimer() failed: %s", hs_win32_strerror(0));
-            }
-
-            if (r < 0) {
-                EnterCriticalSection(&monitor->events_lock);
-                monitor->thread_ret = r;
-                SetEvent(monitor->thread_event);
-                LeaveCriticalSection(&monitor->events_lock);
-            }
-        } break;
-
-        case WM_TIMER: {
-            if (CMP_WaitNoPendingInstallEvents(0) == WAIT_OBJECT_0) {
-                KillTimer(hwnd, 1);
-
-                EnterCriticalSection(&monitor->events_lock);
-                r = _hs_array_grow(&monitor->events, monitor->thread_events.count);
-                if (r < 0) {
-                    monitor->thread_ret = r;
-                } else {
-                    memcpy(monitor->events.values + monitor->events.count,
-                           monitor->thread_events.values,
-                           monitor->thread_events.count * sizeof(*monitor->thread_events.values));
-                    monitor->events.count += monitor->thread_events.count;
-                    _hs_array_release(&monitor->thread_events);
-                }
-                SetEvent(monitor->thread_event);
-                LeaveCriticalSection(&monitor->events_lock);
-            }
-        } break;
-
-        case WM_CLOSE: {
-            PostQuitMessage(0);
-        } break;
-    }
-
-    return DefWindowProc(hwnd, msg, wparam, lparam);
-}
-
-static void unregister_monitor_class(void)
-{
-    UnregisterClass(MONITOR_CLASS_NAME, GetModuleHandle(NULL));
-}
-
-static unsigned int __stdcall monitor_thread(void *udata)
-{
-    _HS_UNUSED(udata);
-
-    hs_monitor *monitor = (hs_monitor *)udata;
-
-    WNDCLASSEX cls = {0};
-    ATOM cls_atom;
-    DEV_BROADCAST_DEVICEINTERFACE filter = {0};
-    HDEVNOTIFY notify_handle = NULL;
-    MSG msg;
-    int r;
-
-    cls.cbSize = sizeof(cls);
-    cls.hInstance = GetModuleHandle(NULL);
-    cls.lpszClassName = MONITOR_CLASS_NAME;
-    cls.lpfnWndProc = window_proc;
-
-    /* If this fails, CreateWindow() will fail too so we can ignore errors here. This
-       also takes care of any failure that may result from the class already existing. */
-    cls_atom = RegisterClassEx(&cls);
-    if (cls_atom)
-        atexit(unregister_monitor_class);
-
-    monitor->thread_hwnd = CreateWindow(MONITOR_CLASS_NAME, MONITOR_CLASS_NAME, 0, 0, 0, 0, 0,
-                                        HWND_MESSAGE, NULL, NULL, NULL);
-    if (!monitor->thread_hwnd) {
-        r = hs_error(HS_ERROR_SYSTEM, "CreateWindow() failed: %s", hs_win32_strerror(0));
-        goto cleanup;
-    }
-
-    SetLastError(0);
-    SetWindowLongPtr(monitor->thread_hwnd, GWLP_USERDATA, (LONG_PTR)monitor);
-    if (GetLastError()) {
-        r = hs_error(HS_ERROR_SYSTEM, "SetWindowLongPtr() failed: %s", hs_win32_strerror(0));
-        goto cleanup;
-    }
-
-    filter.dbcc_size = sizeof(filter);
-    filter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
-
-    /* We monitor everything because I cannot find an interface class to detect
-       serial devices within an IAD, and RegisterDeviceNotification() does not
-       support device setup class filtering. */
-    notify_handle = RegisterDeviceNotification(monitor->thread_hwnd, &filter,
-                                               DEVICE_NOTIFY_WINDOW_HANDLE | DEVICE_NOTIFY_ALL_INTERFACE_CLASSES);
-    if (!notify_handle) {
-        r = hs_error(HS_ERROR_SYSTEM, "RegisterDeviceNotification() failed: %s", hs_win32_strerror(0));
-        goto cleanup;
-    }
-
-    /* Our fake window is created and ready to receive device notifications,
-       hs_monitor_new() can go on. */
-    SetEvent(monitor->thread_event);
-
-    /* As it turns out, GetMessage() cannot fail if the parameters are correct.
-       https://blogs.msdn.microsoft.com/oldnewthing/20130322-00/?p=4873/ */
-    while (GetMessage(&msg, NULL, 0, 0) != 0) {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
-    }
-
-    r = 0;
-cleanup:
-    if (notify_handle)
-        UnregisterDeviceNotification(notify_handle);
-    if (monitor->thread_hwnd)
-        DestroyWindow(monitor->thread_hwnd);
-    if (r < 0) {
-        monitor->thread_ret = r;
-        SetEvent(monitor->thread_event);
-    }
-    return 0;
-}
-
-static int monitor_enumerate_callback(hs_device *dev, void *udata)
-{
-    hs_monitor *monitor = (hs_monitor *)udata;
-    return _hs_monitor_add(&monitor->devices, dev, NULL, NULL);
-}
-
-/* Monitoring device changes on Windows involves a window to receive device notifications on the
-   thread message queue. Unfortunately we can't poll on message queues so instead, we make a
-   background thread to get device notifications, and tell us about it using Win32 events which
-   we can poll. */
-int hs_monitor_new(const hs_match_spec *matches, unsigned int count, hs_monitor **rmonitor)
-{
-    assert(rmonitor);
-
-    hs_monitor *monitor;
-    int r;
-
-    monitor = (hs_monitor *)calloc(1, sizeof(*monitor));
-    if (!monitor) {
-        r = hs_error(HS_ERROR_MEMORY, NULL);
-        goto error;
-    }
-
-    r = _hs_match_helper_init(&monitor->match_helper, matches, count);
-    if (r < 0)
-        goto error;
-
-    r = _hs_htable_init(&monitor->devices, 64);
-    if (r < 0)
-        goto error;
-
-    InitializeCriticalSection(&monitor->events_lock);
-    monitor->thread_event = CreateEvent(NULL, TRUE, FALSE, NULL);
-    if (!monitor->thread_event) {
-        r = hs_error(HS_ERROR_SYSTEM, "CreateEvent() failed: %s", hs_win32_strerror(0));
-        goto error;
-    }
-
-    *rmonitor = monitor;
-    return 0;
-
-error:
-    hs_monitor_free(monitor);
-    return r;
-}
-
-void hs_monitor_free(hs_monitor *monitor)
-{
-    if (monitor) {
-        hs_monitor_stop(monitor);
-
-        DeleteCriticalSection(&monitor->events_lock);
-        if (monitor->thread_event)
-            CloseHandle(monitor->thread_event);
-
-        _hs_monitor_clear_devices(&monitor->devices);
-        _hs_htable_release(&monitor->devices);
-        _hs_match_helper_release(&monitor->match_helper);
-    }
-
-    free(monitor);
-}
-
-hs_handle hs_monitor_get_poll_handle(const hs_monitor *monitor)
-{
-    assert(monitor);
-    return monitor->thread_event;
-}
-
-int hs_monitor_start(hs_monitor *monitor)
-{
-    assert(monitor);
-    assert(!monitor->thread);
-
-    int r;
-
-    if (monitor->thread)
-        return 0;
-
-    /* We can't create our fake window here, because the messages would be posted to this thread's
-       message queue and not to the monitoring thread. So instead, the background thread creates
-       its own window and we wait for it to signal us before we continue. */
-    monitor->thread = (HANDLE)_beginthreadex(NULL, 0, monitor_thread, monitor, 0, NULL);
-    if (!monitor->thread) {
-        r = hs_error(HS_ERROR_SYSTEM, "_beginthreadex() failed: %s", hs_win32_strerror(0));
-        goto error;
-    }
-
-    WaitForSingleObject(monitor->thread_event, INFINITE);
-    if (monitor->thread_ret < 0) {
-        r = monitor->thread_ret;
-        goto error;
-    }
-    ResetEvent(monitor->thread_event);
-
-    r = enumerate(&monitor->match_helper, monitor_enumerate_callback, monitor);
-    if (r < 0)
-        goto error;
-
-    return 0;
-
-error:
-    hs_monitor_stop(monitor);
-    return r;
-}
-
-void hs_monitor_stop(hs_monitor *monitor)
-{
-    assert(monitor);
-
-    if (!monitor->thread)
-        return;
-
-    _hs_monitor_clear_devices(&monitor->devices);
-
-    if (monitor->thread_hwnd) {
-        PostMessage(monitor->thread_hwnd, WM_CLOSE, 0, 0);
-        WaitForSingleObject(monitor->thread, INFINITE);
-    }
-    CloseHandle(monitor->thread);
-    monitor->thread = NULL;
-
-    _hs_array_release(&monitor->events);
-    _hs_array_release(&monitor->thread_events);
-    _hs_array_release(&monitor->refresh_events);
-}
-
-static int process_arrival_event(hs_monitor *monitor, const char *key, hs_enumerate_func *f,
-                                 void *udata)
-{
-    DEVINST inst;
-    hs_device *dev = NULL;
-    CONFIGRET cret;
-    int r;
-
-    cret = CM_Locate_DevNode(&inst, (DEVINSTID)key, CM_LOCATE_DEVNODE_NORMAL);
-    if (cret != CR_SUCCESS) {
-        hs_log(HS_LOG_DEBUG, "Device node '%s' does not exist: 0x%lx", key, cret);
-        return 0;
-    }
-
-    r = process_win32_device(inst, &dev);
-    if (r <= 0)
-        return r;
-
-    r = _hs_match_helper_match(&monitor->match_helper, dev, &dev->match_udata);
-    if (r)
-        r = _hs_monitor_add(&monitor->devices, dev, f, udata);
-    hs_device_unref(dev);
-
-    return r;
-}
-
-int hs_monitor_refresh(hs_monitor *monitor, hs_enumerate_func *f, void *udata)
-{
-    assert(monitor);
-
-    unsigned int event_idx = 0;
-    int r;
-
-    if (!monitor->thread)
-        return 0;
-
-    if (!monitor->refresh_events.count) {
-        /* We don't want to keep the lock for too long, so move all device events to our
-           own array and let the background thread work and process Win32 events. */
-        EnterCriticalSection(&monitor->events_lock);
-        monitor->refresh_events = monitor->events;
-        memset(&monitor->events, 0, sizeof(monitor->events));
-        r = monitor->thread_ret;
-        monitor->thread_ret = 0;
-        LeaveCriticalSection(&monitor->events_lock);
-
-        if (r < 0)
-            goto cleanup;
-    }
-
-    for (; event_idx < monitor->refresh_events.count; event_idx++) {
-        struct event *event = &monitor->refresh_events.values[event_idx];
-
-        switch (event->type) {
-            case DEVICE_EVENT_ADDED: {
-                hs_log(HS_LOG_DEBUG, "Received arrival notification for device '%s'",
-                       event->device_key);
-                r = process_arrival_event(monitor, event->device_key, f, udata);
-                if (r)
-                    goto cleanup;
-            } break;
-
-            case DEVICE_EVENT_REMOVED: {
-                hs_log(HS_LOG_DEBUG, "Received removal notification for device '%s'",
-                       event->device_key);
-                _hs_monitor_remove(&monitor->devices, event->device_key, f, udata);
-            } break;
-        }
-    }
-
-    r = 0;
-cleanup:
-    /* If an error occurs, there may be unprocessed notifications. Keep them in
-       monitor->refresh_events for the next time this function is called. */
-    _hs_array_remove(&monitor->refresh_events, 0, event_idx);
-    EnterCriticalSection(&monitor->events_lock);
-    if (!monitor->refresh_events.count && !monitor->events.count)
-        ResetEvent(monitor->thread_event);
-    LeaveCriticalSection(&monitor->events_lock);
-    return r;
-}
-
-int hs_monitor_list(hs_monitor *monitor, hs_enumerate_func *f, void *udata)
-{
-    return _hs_monitor_list(&monitor->devices, f, udata);
-}
-
-// platform_win32.c
-// ------------------------------------
-
-// #include "common_priv.h"
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-// #include "platform.h"
-
-typedef LONG NTAPI RtlGetVersion_func(OSVERSIONINFOW *info);
-
-uint64_t hs_millis(void)
-{
-    return GetTickCount64();
-}
-
-void hs_delay(unsigned int ms)
-{
-    Sleep(ms);
-}
-
-int hs_poll(hs_poll_source *sources, unsigned int count, int timeout)
-{
-    assert(sources);
-    assert(count);
-    assert(count <= HS_POLL_MAX_SOURCES);
-
-    HANDLE handles[HS_POLL_MAX_SOURCES];
-
-    for (unsigned int i = 0; i < count; i++) {
-        handles[i] = sources[i].desc;
-        sources[i].ready = 0;
-    }
-
-    DWORD ret = WaitForMultipleObjects((DWORD)count, handles, FALSE,
-                                       timeout < 0 ? INFINITE : (DWORD)timeout);
-    if (ret == WAIT_FAILED)
-        return hs_error(HS_ERROR_SYSTEM, "WaitForMultipleObjects() failed: %s",
-                        hs_win32_strerror(0));
-
-    for (unsigned int i = 0; i < count; i++)
-        sources[i].ready = (i == ret);
-
-    return ret < count;
-}
-
-const char *hs_win32_strerror(DWORD err)
-{
-    static _HS_THREAD_LOCAL char buf[256];
-    char *ptr;
-    DWORD r;
-
-    if (!err)
-        err = GetLastError();
-
-    r = FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL,
-                      err, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), buf, sizeof(buf), NULL);
-
-    if (r) {
-        ptr = buf + strlen(buf);
-        // FormatMessage adds newlines, remove them
-        while (ptr > buf && (ptr[-1] == '\n' || ptr[-1] == '\r'))
-            ptr--;
-        *ptr = 0;
-    } else {
-        sprintf(buf, "Unknown error 0x%08lx", err);
-    }
-
-    return buf;
-}
-
-uint32_t hs_win32_version(void)
-{
-    static uint32_t version;
-
-    if (!version) {
-        OSVERSIONINFOW info;
-
-        // Windows 8.1 broke GetVersionEx, so bypass the intermediary
-        info.dwOSVersionInfoSize = sizeof(info);
-
-        RtlGetVersion_func *RtlGetVersion =
-            (RtlGetVersion_func *)GetProcAddress(GetModuleHandle("ntdll.dll"), "RtlGetVersion");
-        RtlGetVersion(&info);
-
-        version = info.dwMajorVersion * 100 + info.dwMinorVersion;
-    }
-
-    return version;
-}
-
-// serial_win32.c
-// ------------------------------------
-
-// #include "common_priv.h"
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-// #include "device_priv.h"
-// #include "platform.h"
-// #include "serial.h"
-
-int hs_serial_set_config(hs_port *port, const hs_serial_config *config)
-{
-    assert(port);
-    assert(config);
-
-    DCB dcb;
-    BOOL success;
-
-    dcb.DCBlength = sizeof(dcb);
-    success = GetCommState(port->u.handle.h, &dcb);
-    if (!success)
-        return hs_error(HS_ERROR_SYSTEM, "GetCommState() failed on '%s': %s", port->dev->path,
-                        hs_win32_strerror(0));
-
-    switch (config->baudrate) {
-        case 0: {} break;
-
-        case 110:
-        case 134:
-        case 150:
-        case 200:
-        case 300:
-        case 600:
-        case 1200:
-        case 1800:
-        case 2400:
-        case 4800:
-        case 9600:
-        case 19200:
-        case 38400:
-        case 57600:
-        case 115200:
-        case 230400: {
-            dcb.BaudRate = config->baudrate;
-        } break;
-
-        default: {
-            return hs_error(HS_ERROR_SYSTEM, "Unsupported baud rate value: %u", config->baudrate);
-        } break;
-    }
-
-    switch (config->databits) {
-        case 0: {} break;
-
-        case 5:
-        case 6:
-        case 7:
-        case 8: {
-            dcb.ByteSize = (BYTE)config->databits;
-        } break;
-
-        default: {
-            return hs_error(HS_ERROR_SYSTEM, "Invalid data bits setting: %u", config->databits);
-        } break;
-    }
-
-    switch (config->stopbits) {
-        case 0: {} break;
-
-        case 1: { dcb.StopBits = ONESTOPBIT; } break;
-        case 2: { dcb.StopBits = TWOSTOPBITS; } break;
-
-        default: {
-            return hs_error(HS_ERROR_SYSTEM, "Invalid stop bits setting: %u", config->stopbits);
-        } break;
-    }
-
-    switch (config->parity) {
-        case 0: {} break;
-
-        case HS_SERIAL_CONFIG_PARITY_OFF: {
-            dcb.fParity = FALSE;
-            dcb.Parity = NOPARITY;
-        } break;
-        case HS_SERIAL_CONFIG_PARITY_EVEN: {
-            dcb.fParity = TRUE;
-            dcb.Parity = EVENPARITY;
-        } break;
-        case HS_SERIAL_CONFIG_PARITY_ODD: {
-            dcb.fParity = TRUE;
-            dcb.Parity = ODDPARITY;
-        } break;
-        case HS_SERIAL_CONFIG_PARITY_MARK: {
-            dcb.fParity = TRUE;
-            dcb.Parity = MARKPARITY;
-        } break;
-        case HS_SERIAL_CONFIG_PARITY_SPACE: {
-            dcb.fParity = TRUE;
-            dcb.Parity = SPACEPARITY;
-        } break;
-
-        default: {
-            return hs_error(HS_ERROR_SYSTEM, "Invalid parity setting: %d", config->parity);
-        } break;
-    }
-
-    switch (config->rts) {
-        case 0: {} break;
-
-        case HS_SERIAL_CONFIG_RTS_OFF: {
-            dcb.fRtsControl = RTS_CONTROL_DISABLE;
-            dcb.fOutxCtsFlow = FALSE;
-        } break;
-        case HS_SERIAL_CONFIG_RTS_ON: {
-            dcb.fRtsControl = RTS_CONTROL_ENABLE;
-            dcb.fOutxCtsFlow = FALSE;
-        } break;
-        case HS_SERIAL_CONFIG_RTS_FLOW: {
-            dcb.fRtsControl = RTS_CONTROL_HANDSHAKE;
-            dcb.fOutxCtsFlow = TRUE;
-        } break;
-
-        default: {
-            return hs_error(HS_ERROR_SYSTEM, "Invalid RTS setting: %d", config->rts);
-        } break;
-    }
-
-    switch (config->dtr) {
-        case 0: {} break;
-
-        case HS_SERIAL_CONFIG_DTR_OFF: {
-            dcb.fDtrControl = DTR_CONTROL_DISABLE;
-            dcb.fOutxDsrFlow = FALSE;
-        } break;
-        case HS_SERIAL_CONFIG_DTR_ON: {
-            dcb.fDtrControl = DTR_CONTROL_ENABLE;
-            dcb.fOutxDsrFlow = FALSE;
-        } break;
-
-        default: {
-            return hs_error(HS_ERROR_SYSTEM, "Invalid DTR setting: %d", config->dtr);
-        } break;
-    }
-
-    switch (config->xonxoff) {
-        case 0: {} break;
-
-        case HS_SERIAL_CONFIG_XONXOFF_OFF: {
-            dcb.fOutX = FALSE;
-            dcb.fInX = FALSE;
-        } break;
-        case HS_SERIAL_CONFIG_XONXOFF_IN: {
-            dcb.fOutX = FALSE;
-            dcb.fInX = TRUE;
-        } break;
-        case HS_SERIAL_CONFIG_XONXOFF_OUT: {
-            dcb.fOutX = TRUE;
-            dcb.fInX = FALSE;
-        } break;
-        case HS_SERIAL_CONFIG_XONXOFF_INOUT: {
-            dcb.fOutX = TRUE;
-            dcb.fInX = TRUE;
-        } break;
-
-        default: {
-            return hs_error(HS_ERROR_SYSTEM, "Invalid XON/XOFF setting: %d", config->xonxoff);
-        } break;
-    }
-
-    success = SetCommState(port->u.handle.h, &dcb);
-    if (!success)
-        return hs_error(HS_ERROR_SYSTEM, "SetCommState() failed on '%s': %s",
-                        port->dev->path, hs_win32_strerror(0));
-
-    return 0;
-}
-
-int hs_serial_get_config(hs_port *port, hs_serial_config *config)
-{
-    assert(port);
-    assert(config);
-
-    DCB dcb;
-    BOOL success;
-
-    dcb.DCBlength = sizeof(dcb);
-    success = GetCommState(port->u.handle.h, &dcb);
-    if (!success)
-        return hs_error(HS_ERROR_SYSTEM, "GetCommState() failed on '%s': %s", port->dev->path,
-                        hs_win32_strerror(0));
-
-    /* 0 is the INVALID value for all parameters, we keep that value if we can't interpret
-       a DCB setting (only a cross-platform subset of it is exposed in hs_serial_config). */
-    memset(config, 0, sizeof(*config));
-
-    config->baudrate = dcb.BaudRate;
-    config->databits = dcb.ByteSize;
-
-    // There is also ONE5STOPBITS, ignore it for now (and ever, probably)
-    switch (dcb.StopBits) {
-        case ONESTOPBIT: { config->stopbits = 1; } break;
-        case TWOSTOPBITS: { config->stopbits = 2; } break;
-    }
-
-    if (dcb.fParity) {
-        switch (dcb.Parity) {
-            case NOPARITY: { config->parity = HS_SERIAL_CONFIG_PARITY_OFF; } break;
-            case EVENPARITY: { config->parity = HS_SERIAL_CONFIG_PARITY_EVEN; } break;
-            case ODDPARITY: { config->parity = HS_SERIAL_CONFIG_PARITY_ODD; } break;
-            case MARKPARITY: { config->parity = HS_SERIAL_CONFIG_PARITY_MARK; } break;
-            case SPACEPARITY: { config->parity = HS_SERIAL_CONFIG_PARITY_SPACE; } break;
-        }
-    } else {
-        config->parity = HS_SERIAL_CONFIG_PARITY_OFF;
-    }
-
-    switch (dcb.fRtsControl) {
-        case RTS_CONTROL_DISABLE: { config->rts = HS_SERIAL_CONFIG_RTS_OFF; } break;
-        case RTS_CONTROL_ENABLE: { config->rts = HS_SERIAL_CONFIG_RTS_ON; } break;
-        case RTS_CONTROL_HANDSHAKE: { config->rts = HS_SERIAL_CONFIG_RTS_FLOW; } break;
-    }
-
-    switch (dcb.fDtrControl) {
-        case DTR_CONTROL_DISABLE: { config->dtr = HS_SERIAL_CONFIG_DTR_OFF; } break;
-        case DTR_CONTROL_ENABLE: { config->dtr = HS_SERIAL_CONFIG_DTR_ON; } break;
-    }
-
-    if (dcb.fInX && dcb.fOutX) {
-        config->xonxoff = HS_SERIAL_CONFIG_XONXOFF_INOUT;
-    } else if (dcb.fInX) {
-        config->xonxoff = HS_SERIAL_CONFIG_XONXOFF_IN;
-    } else if (dcb.fOutX) {
-        config->xonxoff = HS_SERIAL_CONFIG_XONXOFF_OUT;
-    } else {
-        config->xonxoff = HS_SERIAL_CONFIG_XONXOFF_OFF;
-    }
-
-    return 0;
-}
-
-ssize_t hs_serial_read(hs_port *port, uint8_t *buf, size_t size, int timeout)
-{
-    assert(port);
-    assert(port->dev->type == HS_DEVICE_TYPE_SERIAL);
-    assert(port->mode & HS_PORT_MODE_READ);
-    assert(buf);
-    assert(size);
-
-    if (port->u.handle.read_status < 0) {
-        // Could be a transient error, try to restart it
-        _hs_win32_start_async_read(port);
-        if (port->u.handle.read_status < 0)
-            return port->u.handle.read_status;
-    }
-
-    /* Serial devices are stream-based. If we don't have any data yet, see if our asynchronous
-       read request has returned anything. Then we can just give the user the data we have, until
-       our buffer is empty. We can't just discard stuff, unlike what we do for long HID messages. */
-    if (!port->u.handle.read_len) {
-        _hs_win32_finalize_async_read(port, timeout);
-        if (port->u.handle.read_status <= 0)
-            return port->u.handle.read_status;
-    }
-
-    if (size > port->u.handle.read_len)
-        size = port->u.handle.read_len;
-    memcpy(buf, port->u.handle.read_ptr, size);
-    port->u.handle.read_ptr += size;
-    port->u.handle.read_len -= size;
-
-    /* Our buffer has been fully read, start a new asynchonous request. I don't know how
-       much latency this brings. Maybe double buffering would help, but not before any concrete
-       benchmarking is done. */
-    if (!port->u.handle.read_len) {
-        hs_error_mask(HS_ERROR_IO);
-        _hs_win32_start_async_read(port);
-        hs_error_unmask();
-    }
-
-    return (ssize_t)size;
-}
-
-ssize_t hs_serial_write(hs_port *port, const uint8_t *buf, size_t size, int timeout)
-{
-    assert(port);
-    assert(port->dev->type == HS_DEVICE_TYPE_SERIAL);
-    assert(port->mode & HS_PORT_MODE_WRITE);
-    assert(buf);
-    
-    if (!size)
-        return 0;
-
-    return _hs_win32_write_sync(port, buf, size, timeout);
-}
-
-    #elif defined(__APPLE__)
 // device_posix.c
 // ------------------------------------
+
+#ifndef _WIN32
 
 // #include "common_priv.h"
 #include <fcntl.h>
@@ -4748,6 +2160,389 @@ void _hs_close_file_port(hs_port *port)
 hs_handle _hs_get_file_port_poll_handle(const hs_port *port)
 {
     return port->u.file.fd;
+}
+
+#endif
+
+// device_win32.c
+// ------------------------------------
+
+// #include "common_priv.h"
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <process.h>
+// #include "device_priv.h"
+// #include "platform.h"
+
+#define READ_BUFFER_SIZE 16384
+
+int _hs_open_file_port(hs_device *dev, hs_port_mode mode, hs_port **rport)
+{
+    hs_port *port = NULL;
+    DWORD access;
+    int r;
+
+    port = (hs_port *)calloc(1, sizeof(*port));
+    if (!port) {
+        r = hs_error(HS_ERROR_MEMORY, NULL);
+        goto error;
+    }
+    port->type = dev->type;
+
+    port->mode = mode;
+    port->path = dev->path;
+    port->dev = hs_device_ref(dev);
+
+    access = UINT32_MAX;
+    switch (mode) {
+        case HS_PORT_MODE_READ: { access = GENERIC_READ; } break;
+        case HS_PORT_MODE_WRITE: { access = GENERIC_WRITE; } break;
+        case HS_PORT_MODE_RW: { access = GENERIC_READ | GENERIC_WRITE; } break;
+    }
+    assert(access != UINT32_MAX);
+
+    port->u.handle.h = CreateFileA(dev->path, access, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                   NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+    if (port->u.handle.h == INVALID_HANDLE_VALUE) {
+        switch (GetLastError()) {
+            case ERROR_FILE_NOT_FOUND:
+            case ERROR_PATH_NOT_FOUND: {
+                r = hs_error(HS_ERROR_NOT_FOUND, "Device '%s' not found", dev->path);
+            } break;
+            case ERROR_NOT_ENOUGH_MEMORY:
+            case ERROR_OUTOFMEMORY: {
+                r = hs_error(HS_ERROR_MEMORY, NULL);
+            } break;
+            case ERROR_ACCESS_DENIED: {
+                r = hs_error(HS_ERROR_ACCESS, "Permission denied for device '%s'", dev->path);
+            } break;
+
+            default: {
+                r = hs_error(HS_ERROR_SYSTEM, "CreateFile('%s') failed: %s", dev->path,
+                             hs_win32_strerror(0));
+            } break;
+        }
+        goto error;
+    }
+
+    if (dev->type == HS_DEVICE_TYPE_SERIAL) {
+        DCB dcb;
+        COMMTIMEOUTS timeouts;
+        BOOL success;
+
+        dcb.DCBlength = sizeof(dcb);
+        success = GetCommState(port->u.handle.h, &dcb);
+        if (!success) {
+            r = hs_error(HS_ERROR_SYSTEM, "GetCommState() failed on '%s': %s", port->path,
+                         hs_win32_strerror(0));
+            goto error;
+        }
+
+        /* Sane config, inspired by libserialport, and with DTR pin on by default for
+           consistency with UNIX platforms. */
+        dcb.fBinary = TRUE;
+        dcb.fAbortOnError = FALSE;
+        dcb.fErrorChar = FALSE;
+        dcb.fNull = FALSE;
+        dcb.fDtrControl = DTR_CONTROL_ENABLE;
+        dcb.fDsrSensitivity = FALSE;
+
+        /* See SERIAL_TIMEOUTS documentation on MSDN, this basically means "Terminate read request
+           when there is at least one byte available". You still need a total timeout in that mode
+           so use 0xFFFFFFFE (using 0xFFFFFFFF for all read timeouts is not allowed). Using
+           WaitCommEvent() instead would probably be a good idea, I'll look into that later. */
+        timeouts.ReadIntervalTimeout = ULONG_MAX;
+        timeouts.ReadTotalTimeoutMultiplier = ULONG_MAX;
+        timeouts.ReadTotalTimeoutConstant = ULONG_MAX - 1;
+        timeouts.WriteTotalTimeoutMultiplier = 0;
+        timeouts.WriteTotalTimeoutConstant = 5000;
+
+        success = SetCommState(port->u.handle.h, &dcb);
+        if (!success) {
+            r = hs_error(HS_ERROR_SYSTEM, "SetCommState() failed on '%s': %s",
+                         port->path, hs_win32_strerror(0));
+            goto error;
+        }
+        success = SetCommTimeouts(port->u.handle.h, &timeouts);
+        if (!success) {
+            r = hs_error(HS_ERROR_SYSTEM, "SetCommTimeouts() failed on '%s': %s",
+                         port->path, hs_win32_strerror(0));
+            goto error;
+        }
+        success = PurgeComm(port->u.handle.h, PURGE_RXCLEAR);
+        if (!success) {
+            r = hs_error(HS_ERROR_SYSTEM, "PurgeComm(PURGE_RXCLEAR) failed on '%s': %s",
+                         port->path, hs_win32_strerror(0));
+            goto error;
+        }
+    }
+
+    if (mode & HS_PORT_MODE_READ) {
+        port->u.handle.read_ov = (OVERLAPPED *)calloc(1, sizeof(*port->u.handle.read_ov));
+        if (!port->u.handle.read_ov) {
+            r = hs_error(HS_ERROR_MEMORY, NULL);
+            goto error;
+        }
+
+        port->u.handle.read_ov->hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+        if (!port->u.handle.read_ov->hEvent) {
+            r = hs_error(HS_ERROR_SYSTEM, "CreateEvent() failed: %s", hs_win32_strerror(0));
+            goto error;
+        }
+
+        if (dev->type == HS_DEVICE_TYPE_HID) {
+            port->u.handle.read_buf_size = dev->u.hid.max_input_len + 1;
+        } else {
+            port->u.handle.read_buf_size = READ_BUFFER_SIZE;
+        }
+
+        if (port->u.handle.read_buf_size) {
+            port->u.handle.read_buf = (uint8_t *)malloc(port->u.handle.read_buf_size);
+            if (!port->u.handle.read_buf) {
+                r = hs_error(HS_ERROR_MEMORY, NULL);
+                goto error;
+            }
+
+            _hs_win32_start_async_read(port);
+            if (port->u.handle.read_status < 0) {
+                r = port->u.handle.read_status;
+                goto error;
+            }
+        }
+    }
+
+    if (mode & HS_PORT_MODE_WRITE) {
+        port->u.handle.write_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+        if (!port->u.handle.write_event) {
+            r = hs_error(HS_ERROR_SYSTEM, "CreateEvent() failed: %s", hs_win32_strerror(0));
+            goto error;
+        }
+    }
+
+    *rport = port;
+    return 0;
+
+error:
+    hs_port_close(port);
+    return r;
+}
+
+void _hs_close_file_port(hs_port *port)
+{
+    if (port) {
+        hs_device_unref(port->dev);
+        port->dev = NULL;
+
+        if (CancelIoEx(port->u.handle.h, NULL))
+            WaitForSingleObject(port->u.handle.read_ov->hEvent, INFINITE);
+        if (port->u.handle.h)
+            CloseHandle(port->u.handle.h);
+
+        free(port->u.handle.read_buf);
+        if (port->u.handle.read_ov && port->u.handle.read_ov->hEvent)
+            CloseHandle(port->u.handle.read_ov->hEvent);
+        free(port->u.handle.read_ov);
+
+        if (port->u.handle.write_event)
+            CloseHandle(port->u.handle.write_event);
+    }
+
+    free(port);
+}
+
+hs_handle _hs_get_file_port_poll_handle(const hs_port *port)
+{
+    return port->u.handle.read_ov->hEvent;
+}
+
+// Call only when port->status != 0, otherwise you will leak kernel memory
+void _hs_win32_start_async_read(hs_port *port)
+{
+    DWORD ret;
+
+    ret = (DWORD)ReadFile(port->u.handle.h, port->u.handle.read_buf,
+                          (DWORD)port->u.handle.read_buf_size, NULL, port->u.handle.read_ov);
+    if (!ret && GetLastError() != ERROR_IO_PENDING) {
+        CancelIo(port->u.handle.h);
+
+        port->u.handle.read_status = hs_error(HS_ERROR_IO, "I/O error while reading from '%s'",
+                                           port->path);
+        return;
+    }
+
+    port->u.handle.read_status = 0;
+}
+
+void _hs_win32_finalize_async_read(hs_port *port, int timeout)
+{
+    DWORD len, ret;
+
+    if (!port->u.handle.read_buf_size)
+        return;
+
+    if (timeout > 0)
+        WaitForSingleObject(port->u.handle.read_ov->hEvent, (DWORD)timeout);
+    ret = (DWORD)GetOverlappedResult(port->u.handle.h, port->u.handle.read_ov, &len, timeout < 0);
+    if (!ret) {
+        if (GetLastError() == ERROR_IO_INCOMPLETE) {
+            port->u.handle.read_status = 0;
+            return;
+        }
+
+        port->u.handle.read_status = hs_error(HS_ERROR_IO, "I/O error while reading from '%s'",
+                                              port->path);
+        return;
+    }
+
+    port->u.handle.read_len = (size_t)len;
+    port->u.handle.read_ptr = port->u.handle.read_buf;
+
+    port->u.handle.read_status = 1;
+}
+
+ssize_t _hs_win32_write_sync(hs_port *port, const uint8_t *buf, size_t size, int timeout)
+{
+    OVERLAPPED ov = {0};
+    DWORD len;
+    BOOL success;
+
+    ov.hEvent = port->u.handle.write_event;
+    success = WriteFile(port->u.handle.h, buf, (DWORD)size, NULL, &ov);
+    if (!success && GetLastError() != ERROR_IO_PENDING)
+        return hs_error(HS_ERROR_IO, "I/O error while writing to '%s'", port->path);
+
+    if (timeout > 0)
+        WaitForSingleObject(ov.hEvent, (DWORD)timeout);
+
+    success = GetOverlappedResult(port->u.handle.h, &ov, &len, timeout < 0);
+    if (!success) {
+        if (GetLastError() == ERROR_IO_INCOMPLETE) {
+            CancelIoEx(port->u.handle.h, &ov);
+
+            success = GetOverlappedResult(port->u.handle.h, &ov, &len, TRUE);
+            if (!success)
+                len = 0;
+        } else {
+            return hs_error(HS_ERROR_IO, "I/O error while writing to '%s'", port->path);
+        }
+    }
+
+    return (ssize_t)len;
+}
+
+#endif
+
+// match.c
+// ------------------------------------
+
+// #include "common_priv.h"
+#ifndef _WIN32
+    #include <sys/stat.h>
+#endif
+// #include "match_priv.h"
+
+int hs_match_parse(const char *str, hs_match_spec *rspec)
+{
+    unsigned int vid = 0, pid = 0, type = 0;
+
+    str += strspn(str, " ");
+    if (str[0]) {
+        char type_buf[16];
+        int r;
+
+        r = sscanf(str, "%04x:%04x/%15s", &vid, &pid, type_buf);
+        if (r < 2)
+            return hs_error(HS_ERROR_PARSE, "Malformed device match string '%s'", str);
+
+        if (r == 3) {
+            for (unsigned int i = 1; i < _HS_COUNTOF(hs_device_type_strings); i++) {
+                if (!strcmp(hs_device_type_strings[i], type_buf))
+                    type = i;
+            }
+            if (!type)
+                return hs_error(HS_ERROR_PARSE, "Unknown device type '%s' in match string '%s'",
+                                type_buf, str);
+        }
+    }
+
+    memset(rspec, 0, sizeof(*rspec));
+    rspec->vid = (uint16_t)vid;
+    rspec->pid = (uint16_t)pid;
+    rspec->type = type;
+    return 0;
+}
+
+int _hs_match_helper_init(_hs_match_helper *helper, const hs_match_spec *specs,
+                          unsigned int specs_count)
+{
+    if (!specs) {
+        helper->specs = NULL;
+        helper->specs_count = 0;
+        helper->types = UINT32_MAX;
+
+        return 0;
+    }
+
+    // I promise to be careful
+    helper->specs = specs_count ? (hs_match_spec *)specs : NULL;
+    helper->specs_count = specs_count;
+
+    helper->types = 0;
+    for (unsigned int i = 0; i < specs_count; i++) {
+        if (!specs[i].type) {
+            helper->types = UINT32_MAX;
+            break;
+        }
+
+        helper->types |= (uint32_t)(1 << specs[i].type);
+    }
+
+    return 0;
+}
+
+void _hs_match_helper_release(_hs_match_helper *helper)
+{
+    _HS_UNUSED(helper);
+}
+
+static bool test_spec(const hs_match_spec *spec, const hs_device *dev)
+{
+    if (spec->type && dev->type != (hs_device_type)spec->type)
+        return false;
+    if (spec->vid && dev->vid != spec->vid)
+        return false;
+    if (spec->pid && dev->pid != spec->pid)
+        return false;
+
+    return true;
+}
+
+bool _hs_match_helper_match(const _hs_match_helper *helper, const hs_device *dev,
+                            void **rmatch_udata)
+{
+    // Do the fast checks first
+    if (!_hs_match_helper_has_type(helper, dev->type))
+        return false;
+    if (!helper->specs_count) {
+        if (rmatch_udata)
+            *rmatch_udata = NULL;
+        return true;
+    }
+
+    for (unsigned int i = 0; i < helper->specs_count; i++) {
+        if (test_spec(&helper->specs[i], dev)) {
+            if (rmatch_udata)
+                *rmatch_udata = helper->specs[i].udata;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool _hs_match_helper_has_type(const _hs_match_helper *helper, hs_device_type type)
+{
+    return helper->types & (uint32_t)(1 << type);
 }
 
 // hid_darwin.c
@@ -5238,6 +3033,2678 @@ ssize_t hs_hid_send_feature_report(hs_port *port, const uint8_t *buf, size_t siz
     return send_report(port, kIOHIDReportTypeFeature, buf, size);
 }
 
+#endif
+
+// hid_linux.c
+// ------------------------------------
+
+// #include "common_priv.h"
+#include <fcntl.h>
+#include <linux/hidraw.h>
+#include <poll.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+// #include "device_priv.h"
+// #include "hid.h"
+// #include "platform.h"
+
+static bool detect_kernel26_byte_bug()
+{
+    static bool init, bug;
+
+    if (!init) {
+        bug = hs_linux_version() >= 20628000 && hs_linux_version() < 20634000;
+        init = true;
+    }
+
+    return bug;
+}
+
+ssize_t hs_hid_read(hs_port *port, uint8_t *buf, size_t size, int timeout)
+{
+    assert(port);
+    assert(port->type == HS_DEVICE_TYPE_HID);
+    assert(port->mode & HS_PORT_MODE_READ);
+    assert(buf);
+    assert(size);
+
+    ssize_t r;
+
+    if (timeout) {
+        struct pollfd pfd;
+        uint64_t start;
+
+        pfd.events = POLLIN;
+        pfd.fd = port->u.file.fd;
+
+        start = hs_millis();
+restart:
+        r = poll(&pfd, 1, hs_adjust_timeout(timeout, start));
+        if (r < 0) {
+            if (errno == EINTR)
+                goto restart;
+
+            return hs_error(HS_ERROR_IO, "I/O error while reading from '%s': %s", port->path,
+                            strerror(errno));
+        }
+        if (!r)
+            return 0;
+    }
+
+    if (port->u.file.numbered_hid_reports) {
+        /* Work around a hidraw bug introduced in Linux 2.6.28 and fixed in Linux 2.6.34, see
+           https://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/commit/?id=5a38f2c7c4dd53d5be097930902c108e362584a3 */
+        if (detect_kernel26_byte_bug()) {
+            if (size + 1 > port->u.file.read_buf_size) {
+                free(port->u.file.read_buf);
+                port->u.file.read_buf_size = 0;
+
+                port->u.file.read_buf = (uint8_t *)malloc(size + 1);
+                if (!port->u.file.read_buf)
+                    return hs_error(HS_ERROR_MEMORY, NULL);
+                port->u.file.read_buf_size = size + 1;
+            }
+
+            r = read(port->u.file.fd, port->u.file.read_buf, size + 1);
+            if (r > 0)
+                memcpy(buf, port->u.file.read_buf + 1, (size_t)--r);
+        } else {
+            r = read(port->u.file.fd, buf, size);
+        }
+    } else {
+        r = read(port->u.file.fd, buf + 1, size - 1);
+        if (r > 0) {
+            buf[0] = 0;
+            r++;
+        }
+    }
+    if (r < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            return 0;
+
+        return hs_error(HS_ERROR_IO, "I/O error while reading from '%s': %s", port->path,
+                        strerror(errno));
+    }
+
+    return r;
+}
+
+ssize_t hs_hid_write(hs_port *port, const uint8_t *buf, size_t size)
+{
+    assert(port);
+    assert(port->type == HS_DEVICE_TYPE_HID);
+    assert(port->mode & HS_PORT_MODE_WRITE);
+    assert(buf);
+
+    if (size < 2)
+        return 0;
+
+    ssize_t r;
+
+restart:
+    // On linux, USB requests timeout after 5000ms and O_NONBLOCK isn't honoured for write
+    r = write(port->u.file.fd, (const char *)buf, size);
+    if (r < 0) {
+        if (errno == EINTR)
+            goto restart;
+
+        return hs_error(HS_ERROR_IO, "I/O error while writing to '%s': %s", port->path,
+                        strerror(errno));
+    }
+
+    return r;
+}
+
+ssize_t hs_hid_get_feature_report(hs_port *port, uint8_t report_id, uint8_t *buf, size_t size)
+{
+    assert(port);
+    assert(port->type == HS_DEVICE_TYPE_HID);
+    assert(port->mode & HS_PORT_MODE_READ);
+    assert(buf);
+    assert(size);
+
+    ssize_t r;
+
+    if (size >= 2)
+        buf[1] = report_id;
+
+restart:
+    r = ioctl(port->u.file.fd, HIDIOCGFEATURE(size - 1), (const char *)buf + 1);
+    if (r < 0) {
+        if (errno == EINTR)
+            goto restart;
+
+        return hs_error(HS_ERROR_IO, "I/O error while reading from '%s': %s", port->path,
+                        strerror(errno));
+    }
+
+    buf[0] = report_id;
+    return r + 1;
+}
+
+ssize_t hs_hid_send_feature_report(hs_port *port, const uint8_t *buf, size_t size)
+{
+    assert(port);
+    assert(port->type == HS_DEVICE_TYPE_HID);
+    assert(port->mode & HS_PORT_MODE_WRITE);
+    assert(buf);
+
+    if (size < 2)
+        return 0;
+
+    ssize_t r;
+
+restart:
+    r = ioctl(port->u.file.fd, HIDIOCSFEATURE(size), (const char *)buf);
+    if (r < 0) {
+        if (errno == EINTR)
+            goto restart;
+
+        return hs_error(HS_ERROR_IO, "I/O error while writing to '%s': %s", port->path,
+                        strerror(errno));
+    }
+
+    return r;
+}
+
+#endif
+
+// hid_win32.c
+// ------------------------------------
+
+// #include "common_priv.h"
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+_HS_BEGIN_C
+    #include <hidsdi.h>
+_HS_END_C
+#include <winioctl.h>
+// #include "device_priv.h"
+// #include "hid.h"
+// #include "platform.h"
+
+// Copied from hidclass.h in the MinGW-w64 headers
+#define HID_OUT_CTL_CODE(id) \
+    CTL_CODE(FILE_DEVICE_KEYBOARD, (id), METHOD_OUT_DIRECT, FILE_ANY_ACCESS)
+#define IOCTL_HID_GET_FEATURE HID_OUT_CTL_CODE(100)
+
+ssize_t hs_hid_read(hs_port *port, uint8_t *buf, size_t size, int timeout)
+{
+    assert(port);
+    assert(port->dev->type == HS_DEVICE_TYPE_HID);
+    assert(port->mode & HS_PORT_MODE_READ);
+    assert(buf);
+    assert(size);
+
+    if (port->u.handle.read_status < 0) {
+        // Could be a transient error, try to restart it
+        _hs_win32_start_async_read(port);
+        if (port->u.handle.read_status < 0)
+            return port->u.handle.read_status;
+    }
+
+    _hs_win32_finalize_async_read(port, timeout);
+    if (port->u.handle.read_status <= 0)
+        return port->u.handle.read_status;
+
+    /* HID communication is message-based. So if the caller does not provide a big enough
+       buffer, we can just discard the extra data, unlike for serial communication. */
+    if (port->u.handle.read_len) {
+        if (size > port->u.handle.read_len)
+            size = port->u.handle.read_len;
+        memcpy(buf, port->u.handle.read_buf, size);
+    } else {
+        size = 0;
+    }
+
+    hs_error_mask(HS_ERROR_IO);
+    _hs_win32_start_async_read(port);
+    hs_error_unmask();
+
+    return (ssize_t)size;
+}
+
+ssize_t hs_hid_write(hs_port *port, const uint8_t *buf, size_t size)
+{
+    assert(port);
+    assert(port->dev->type == HS_DEVICE_TYPE_HID);
+    assert(port->mode & HS_PORT_MODE_WRITE);
+    assert(buf);
+
+    if (size < 2)
+        return 0;
+
+    ssize_t r = _hs_win32_write_sync(port, buf, size, 5000);
+    if (!r)
+        return hs_error(HS_ERROR_IO, "Timed out while writing to '%s'", port->dev->path);
+
+    return r;
+}
+
+ssize_t hs_hid_get_feature_report(hs_port *port, uint8_t report_id, uint8_t *buf, size_t size)
+{
+    assert(port);
+    assert(port->dev->type == HS_DEVICE_TYPE_HID);
+    assert(port->mode & HS_PORT_MODE_READ);
+    assert(buf);
+    assert(size);
+
+    OVERLAPPED ov = {0};
+    DWORD len;
+    BOOL success;
+
+    buf[0] = report_id;
+    len = (DWORD)size;
+
+    success = DeviceIoControl(port->u.handle.h, IOCTL_HID_GET_FEATURE, buf, (DWORD)size, buf,
+                              (DWORD)size, NULL, &ov);
+    if (!success && GetLastError() != ERROR_IO_PENDING) {
+        CancelIo(port->u.handle.h);
+        return hs_error(HS_ERROR_IO, "I/O error while writing to '%s'", port->dev->path);
+    }
+
+    success = GetOverlappedResult(port->u.handle.h, &ov, &len, TRUE);
+    if (!success)
+        return hs_error(HS_ERROR_IO, "I/O error while writing to '%s'", port->dev->path);
+
+    /* Apparently the length returned by the IOCTL_HID_GET_FEATURE ioctl does not account
+       for the report ID byte. */
+    return (ssize_t)len + 1;
+}
+
+ssize_t hs_hid_send_feature_report(hs_port *port, const uint8_t *buf, size_t size)
+{
+    assert(port);
+    assert(port->dev->type == HS_DEVICE_TYPE_HID);
+    assert(port->mode & HS_PORT_MODE_WRITE);
+    assert(buf);
+
+    if (size < 2)
+        return 0;
+
+    // Timeout behavior?
+    BOOL success = HidD_SetFeature(port->u.handle.h, (char *)buf, (DWORD)size);
+    if (!success)
+        return hs_error(HS_ERROR_IO, "I/O error while writing to '%s'", port->dev->path);
+
+    return (ssize_t)size;
+}
+
+#endif
+
+// htable.c
+// ------------------------------------
+
+// #include "common_priv.h"
+// #include "htable.h"
+
+int _hs_htable_init(_hs_htable *table, unsigned int size)
+{
+    table->heads = (void **)malloc(size * sizeof(*table->heads));
+    if (!table->heads)
+        return hs_error(HS_ERROR_MEMORY, NULL);
+    table->size = size;
+
+    _hs_htable_clear(table);
+
+    return 0;
+}
+
+void _hs_htable_release(_hs_htable *table)
+{
+    free(table->heads);
+}
+
+_hs_htable_head *_hs_htable_get_head(_hs_htable *table, uint32_t key)
+{
+    return (_hs_htable_head *)&table->heads[key % table->size];
+}
+
+void _hs_htable_add(_hs_htable *table, uint32_t key, _hs_htable_head *n)
+{
+    _hs_htable_head *head = _hs_htable_get_head(table, key);
+
+    n->key = key;
+
+    n->next = head->next;
+    head->next = n;
+}
+
+void _hs_htable_insert(_hs_htable_head *prev, _hs_htable_head *n)
+{
+    n->key = prev->key;
+
+    n->next = prev->next;
+    prev->next = n;
+}
+
+void _hs_htable_remove(_hs_htable_head *head)
+{
+    for (_hs_htable_head *prev = head->next; prev != head; prev = prev->next) {
+        if (prev->next == head) {
+            prev->next = head->next;
+            head->next = NULL;
+
+            break;
+        }
+    }
+}
+
+void _hs_htable_clear(_hs_htable *table)
+{
+    for (unsigned int i = 0; i < table->size; i++)
+        table->heads[i] = (_hs_htable_head *)&table->heads[i];
+}
+
+// monitor_common.c
+// ------------------------------------
+
+// #include "common_priv.h"
+// #include "device_priv.h"
+// #include "match.h"
+// #include "monitor_priv.h"
+
+static int find_callback(hs_device *dev, void *udata)
+{
+    hs_device **rdev = (hs_device **)udata;
+
+    *rdev = hs_device_ref(dev);
+    return 1;
+}
+
+int hs_find(const hs_match_spec *matches, unsigned int count, hs_device **rdev)
+{
+    assert(rdev);
+    return hs_enumerate(matches, count, find_callback, rdev);
+}
+
+void _hs_monitor_clear_devices(_hs_htable *devices)
+{
+    _hs_htable_foreach(cur, devices) {
+        hs_device *dev = _HS_CONTAINER_OF(cur, hs_device, hnode);
+        hs_device_unref(dev);
+    }
+    _hs_htable_clear(devices);
+}
+
+bool _hs_monitor_has_device(_hs_htable *devices, const char *key, uint8_t iface)
+{
+    _hs_htable_foreach_hash(cur, devices, _hs_htable_hash_str(key)) {
+        hs_device *dev = _HS_CONTAINER_OF(cur, hs_device, hnode);
+
+        if (strcmp(dev->key, key) == 0 && dev->iface_number == iface)
+            return true;
+    }
+
+    return false;
+}
+
+int _hs_monitor_add(_hs_htable *devices, hs_device *dev, hs_enumerate_func *f, void *udata)
+{
+    if (_hs_monitor_has_device(devices, dev->key, dev->iface_number))
+        return 0;
+
+    hs_device_ref(dev);
+    _hs_htable_add(devices, _hs_htable_hash_str(dev->key), &dev->hnode);
+
+    _hs_device_log(dev, "Add");
+
+    if (f) {
+        return (*f)(dev, udata);
+    } else {
+        return 0;
+    }
+}
+
+void _hs_monitor_remove(_hs_htable *devices, const char *key, hs_enumerate_func *f,
+                        void *udata)
+{
+    _hs_htable_foreach_hash(cur, devices, _hs_htable_hash_str(key)) {
+        hs_device *dev = _HS_CONTAINER_OF(cur, hs_device, hnode);
+
+        if (strcmp(dev->key, key) == 0) {
+            dev->status = HS_DEVICE_STATUS_DISCONNECTED;
+
+            hs_log(HS_LOG_DEBUG, "Remove device '%s'", dev->key);
+
+            if (f)
+                (*f)(dev, udata);
+
+            _hs_htable_remove(&dev->hnode);
+            hs_device_unref(dev);
+        }
+    }
+}
+
+int _hs_monitor_list(_hs_htable *devices, hs_enumerate_func *f, void *udata)
+{
+    _hs_htable_foreach(cur, devices) {
+        hs_device *dev = _HS_CONTAINER_OF(cur, hs_device, hnode);
+        int r;
+
+        r = (*f)(dev, udata);
+        if (r)
+            return r;
+    }
+
+    return 0;
+}
+
+// monitor_linux.c
+// ------------------------------------
+
+// #include "common_priv.h"
+#include <fcntl.h>
+#include <linux/hidraw.h>
+#include <libudev.h>
+#include <pthread.h>
+#include <sys/eventfd.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+// #include "device_priv.h"
+// #include "match_priv.h"
+// #include "monitor_priv.h"
+// #include "platform.h"
+
+struct hs_monitor {
+    _hs_match_helper match_helper;
+    _hs_htable devices;
+
+    struct udev_monitor *udev_mon;
+    int wait_fd;
+};
+
+struct device_subsystem {
+    const char *subsystem;
+    hs_device_type type;
+};
+
+struct udev_aggregate {
+    struct udev_device *dev;
+    struct udev_device *usb;
+    struct udev_device *iface;
+};
+
+static struct device_subsystem device_subsystems[] = {
+    {"hidraw", HS_DEVICE_TYPE_HID},
+    {"tty",    HS_DEVICE_TYPE_SERIAL},
+    {NULL}
+};
+
+static pthread_mutex_t udev_init_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct udev *udev;
+static int common_eventfd = -1;
+
+#ifndef _GNU_SOURCE
+int dup3(int oldfd, int newfd, int flags);
+#endif
+
+static int compute_device_location(struct udev_device *dev, char **rlocation)
+{
+    const char *busnum, *devpath;
+    char *location;
+    int r;
+
+    busnum = udev_device_get_sysattr_value(dev, "busnum");
+    devpath = udev_device_get_sysattr_value(dev, "devpath");
+
+    if (!busnum || !devpath)
+        return 0;
+
+    r = _hs_asprintf(&location, "usb-%s-%s", busnum, devpath);
+    if (r < 0)
+        return hs_error(HS_ERROR_MEMORY, NULL);
+
+    for (char *ptr = location; *ptr; ptr++) {
+        if (*ptr == '.')
+            *ptr = '-';
+    }
+
+    *rlocation = location;
+    return 1;
+}
+
+static int fill_device_details(struct udev_aggregate *agg, hs_device *dev)
+{
+    const char *buf;
+    int r;
+
+    buf = udev_device_get_subsystem(agg->dev);
+    if (!buf)
+        return 0;
+
+    if (strcmp(buf, "hidraw") == 0) {
+        dev->type = HS_DEVICE_TYPE_HID;
+    } else if (strcmp(buf, "tty") == 0) {
+        dev->type = HS_DEVICE_TYPE_SERIAL;
+    } else {
+        return 0;
+    }
+
+    buf = udev_device_get_devnode(agg->dev);
+    if (!buf || access(buf, F_OK) != 0)
+        return 0;
+    dev->path = strdup(buf);
+    if (!dev->path)
+        return hs_error(HS_ERROR_MEMORY, NULL);
+
+    dev->key = strdup(udev_device_get_devpath(agg->dev));
+    if (!dev->key)
+        return hs_error(HS_ERROR_MEMORY, NULL);
+
+    r = compute_device_location(agg->usb, &dev->location);
+    if (r <= 0)
+        return r;
+
+#define READ_UINT16_ATTRIBUTE(name, ptr) \
+        do { \
+            errno = 0; \
+            buf = udev_device_get_sysattr_value(agg->usb, (name)); \
+            if (!buf) \
+                return 0; \
+            *(ptr) = (uint16_t)strtoul(buf, NULL, 16); \
+            if (errno) \
+                return 0; \
+        } while (false)
+#define READ_STR_ATTRIBUTE(name, ptr) \
+        do { \
+            buf = udev_device_get_sysattr_value(agg->usb, (name)); \
+            if (buf) { \
+                *(ptr) = strdup(buf); \
+                if (!*(ptr)) \
+                    return hs_error(HS_ERROR_MEMORY, NULL); \
+            } \
+        } while (false)
+
+    READ_UINT16_ATTRIBUTE("idVendor", &dev->vid);
+    READ_UINT16_ATTRIBUTE("idProduct", &dev->pid);
+    READ_UINT16_ATTRIBUTE("bcdDevice", &dev->bcd_device);
+    READ_STR_ATTRIBUTE("manufacturer", &dev->manufacturer_string);
+    READ_STR_ATTRIBUTE("product", &dev->product_string);
+    READ_STR_ATTRIBUTE("serial", &dev->serial_number_string);
+
+#undef READ_STR_ATTRIBUTE
+#undef READ_UINT16_ATTRIBUTE
+
+    errno = 0;
+    buf = udev_device_get_devpath(agg->iface);
+    buf += strlen(buf) - 1;
+    dev->iface_number = (uint8_t)strtoul(buf, NULL, 10);
+    if (errno)
+        return 0;
+
+    return 1;
+}
+
+static size_t read_hid_descriptor_sysfs(struct udev_aggregate *agg, uint8_t *desc_buf,
+                                        size_t desc_buf_size)
+{
+    struct udev_device *hid_dev;
+    char report_path[4096];
+    int fd;
+    ssize_t r;
+
+    hid_dev = udev_device_get_parent_with_subsystem_devtype(agg->dev, "hid", NULL);
+    if (!hid_dev)
+        return 0;
+    snprintf(report_path, sizeof(report_path), "%s/report_descriptor",
+             udev_device_get_syspath(hid_dev));
+
+    fd = open(report_path, O_RDONLY);
+    if (fd < 0)
+        return 0;
+    r = read(fd, desc_buf, desc_buf_size);
+    close(fd);
+    if (r < 0)
+        return 0;
+
+    return (size_t)r;
+}
+
+static size_t read_hid_descriptor_hidraw(struct udev_aggregate *agg, uint8_t *desc_buf,
+                                         size_t desc_buf_size)
+{
+    const char *node_path;
+    int fd = -1;
+    int hidraw_desc_size = 0;
+    struct hidraw_report_descriptor hidraw_desc;
+    int r;
+
+    node_path = udev_device_get_devnode(agg->dev);
+    if (!node_path)
+        goto cleanup;
+    fd = open(node_path, O_RDONLY);
+    if (fd < 0)
+        goto cleanup;
+
+    r = ioctl(fd, HIDIOCGRDESCSIZE, &hidraw_desc_size);
+    if (r < 0)
+        goto cleanup;
+    hidraw_desc.size = (uint32_t)hidraw_desc_size;
+    r = ioctl(fd, HIDIOCGRDESC, &hidraw_desc);
+    if (r < 0) {
+        hidraw_desc_size = 0;
+        goto cleanup;
+    }
+
+    if (desc_buf_size > hidraw_desc.size)
+        desc_buf_size = hidraw_desc.size;
+    memcpy(desc_buf, hidraw_desc.value, desc_buf_size);
+
+cleanup:
+    close(fd);
+    return (size_t)hidraw_desc_size;
+}
+
+static void parse_hid_descriptor(hs_device *dev, uint8_t *desc, size_t desc_size)
+{
+    unsigned int collection_depth = 0;
+    unsigned int report_size = 0;
+    unsigned int report_count = 0;
+
+    unsigned int item_size = 0;
+    for (size_t i = 0; i < desc_size; i += item_size + 1) {
+        unsigned int item_type;
+        uint32_t item_data;
+
+        item_type = desc[i];
+
+        if (item_type == 0xFE) {
+            // not interested in long items
+            if (i + 1 < desc_size)
+                item_size = (unsigned int)desc[i + 1] + 2;
+            continue;
+        }
+
+        item_size = item_type & 3;
+        if (item_size == 3)
+            item_size = 4;
+        item_type &= 0xFC;
+
+        if (i + item_size >= desc_size) {
+            hs_log(HS_LOG_WARNING, "Invalid HID descriptor for device '%s'", dev->path);
+            return;
+        }
+
+        // little endian
+        switch (item_size) {
+            case 0: {
+                item_data = 0;
+            } break;
+            case 1: {
+                item_data = desc[i + 1];
+            } break;
+            case 2: {
+                item_data = (uint32_t)(desc[i + 2] << 8) | desc[i + 1];
+            } break;
+            case 4: {
+                item_data = (uint32_t)((desc[i + 4] << 24) | (desc[i + 3] << 16) |
+                                       (desc[i + 2] << 8) | desc[i + 1]);
+            } break;
+
+            // silence unitialized warning
+            default: {
+                item_data = 0;
+            } break;
+        }
+
+        switch (item_type) {
+            case 0xA0: {
+                collection_depth++;
+            } break;
+            case 0xC0: {
+                collection_depth--;
+            } break;
+
+            case 0x74: {
+                report_size = (unsigned int)item_data;
+            } break;
+            case 0x94: {
+                report_count = (unsigned int)item_data;
+            } break;
+            case 0x80: {
+                dev->u.hid.max_input_len += (size_t)(((report_size * report_count) + 7) / 8);
+            } break;
+            case 0x84: {
+                dev->u.hid.numbered_reports = true;
+            } break;
+            case 0x90: {
+                dev->u.hid.max_output_len += (size_t)(((report_size * report_count) + 7) / 8);
+            } break;
+            case 0xB0: {
+                dev->u.hid.max_feature_len += (size_t)(((report_size * report_count) + 7) / 8);
+            } break;
+
+            case 0x04: {
+                if (!collection_depth)
+                    dev->u.hid.usage_page = (uint16_t)item_data;
+            } break;
+            case 0x08: {
+                if (!collection_depth)
+                    dev->u.hid.usage = (uint16_t)item_data;
+            } break;
+        }
+    }
+}
+
+static void fill_hid_properties(struct udev_aggregate *agg, hs_device *dev)
+{
+    uint8_t desc[HID_MAX_DESCRIPTOR_SIZE];
+    size_t desc_size;
+
+    // The sysfs report_descriptor file appeared in 2011, somewhere around Linux 2.6.38
+    desc_size = read_hid_descriptor_sysfs(agg, desc, sizeof(desc));
+    if (!desc_size) {
+        desc_size = read_hid_descriptor_hidraw(agg, desc, sizeof(desc));
+        if (!desc_size) {
+            // This will happen pretty often on old kernels, most HID nodes are root-only
+            hs_log(HS_LOG_DEBUG, "Cannot get HID report descriptor from '%s'", dev->path);
+            return;
+        }
+    }
+
+    parse_hid_descriptor(dev, desc, desc_size);
+}
+
+static int read_device_information(struct udev_device *udev_dev, hs_device **rdev)
+{
+    struct udev_aggregate agg;
+    hs_device *dev = NULL;
+    int r;
+
+    agg.dev = udev_dev;
+    agg.usb = udev_device_get_parent_with_subsystem_devtype(agg.dev, "usb", "usb_device");
+    agg.iface = udev_device_get_parent_with_subsystem_devtype(agg.dev, "usb", "usb_interface");
+    if (!agg.usb || !agg.iface) {
+        r = 0;
+        goto cleanup;
+    }
+
+    dev = (hs_device *)calloc(1, sizeof(*dev));
+    if (!dev) {
+        r = hs_error(HS_ERROR_MEMORY, NULL);
+        goto cleanup;
+    }
+    dev->refcount = 1;
+    dev->status = HS_DEVICE_STATUS_ONLINE;
+
+    r = fill_device_details(&agg, dev);
+    if (r <= 0)
+        goto cleanup;
+
+    if (dev->type == HS_DEVICE_TYPE_HID)
+        fill_hid_properties(&agg, dev);
+
+    *rdev = dev;
+    dev = NULL;
+
+    r = 1;
+cleanup:
+    hs_device_unref(dev);
+    return r;
+}
+
+static void release_udev(void)
+{
+    close(common_eventfd);
+    udev_unref(udev);
+    pthread_mutex_destroy(&udev_init_lock);
+}
+
+static int init_udev(void)
+{
+    static bool atexit_called;
+    int r;
+
+    // fast path
+    if (udev && common_eventfd >= 0)
+        return 0;
+
+    pthread_mutex_lock(&udev_init_lock);
+
+    if (!atexit_called) {
+        atexit(release_udev);
+        atexit_called = true;
+    }
+
+    if (!udev) {
+        udev = udev_new();
+        if (!udev) {
+            r = hs_error(HS_ERROR_SYSTEM, "udev_new() failed");
+            goto cleanup;
+        }
+    }
+
+    if (common_eventfd < 0) {
+        /* We use this as a never-ready placeholder descriptor for all newly created monitors,
+           until hs_monitor_start() creates the udev monitor and its socket. */
+        common_eventfd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+        if (common_eventfd < 0) {
+            r = hs_error(HS_ERROR_SYSTEM, "eventfd() failed: %s", strerror(errno));
+            goto cleanup;
+        }
+    }
+
+    r = 0;
+cleanup:
+    pthread_mutex_unlock(&udev_init_lock);
+    return r;
+}
+
+static int enumerate(_hs_match_helper *match_helper, hs_enumerate_func *f, void *udata)
+{
+    struct udev_enumerate *enumerate;
+    int r;
+
+    enumerate = udev_enumerate_new(udev);
+    if (!enumerate) {
+        r = hs_error(HS_ERROR_MEMORY, NULL);
+        goto cleanup;
+    }
+
+    udev_enumerate_add_match_is_initialized(enumerate);
+    for (unsigned int i = 0; device_subsystems[i].subsystem; i++) {
+        if (_hs_match_helper_has_type(match_helper, device_subsystems[i].type)) {
+            r = udev_enumerate_add_match_subsystem(enumerate, device_subsystems[i].subsystem);
+            if (r < 0) {
+                r = hs_error(HS_ERROR_MEMORY, NULL);
+                goto cleanup;
+            }
+        }
+    }
+
+    // Current implementation of udev_enumerate_scan_devices() does not fail
+    r = udev_enumerate_scan_devices(enumerate);
+    if (r < 0) {
+        r = hs_error(HS_ERROR_SYSTEM, "udev_enumerate_scan_devices() failed");
+        goto cleanup;
+    }
+
+    struct udev_list_entry *cur;
+    udev_list_entry_foreach(cur, udev_enumerate_get_list_entry(enumerate)) {
+        struct udev_device *udev_dev;
+        hs_device *dev;
+
+        udev_dev = udev_device_new_from_syspath(udev, udev_list_entry_get_name(cur));
+        if (!udev_dev) {
+            if (errno == ENOMEM) {
+                r = hs_error(HS_ERROR_MEMORY, NULL);
+                goto cleanup;
+            }
+            continue;
+        }
+
+        r = read_device_information(udev_dev, &dev);
+        udev_device_unref(udev_dev);
+        if (r < 0)
+            goto cleanup;
+        if (!r)
+            continue;
+
+        if (_hs_match_helper_match(match_helper, dev, &dev->match_udata)) {
+            r = (*f)(dev, udata);
+            hs_device_unref(dev);
+            if (r)
+                goto cleanup;
+        } else {
+            hs_device_unref(dev);
+        }
+    }
+
+    r = 0;
+cleanup:
+    udev_enumerate_unref(enumerate);
+    return r;
+}
+
+struct enumerate_enumerate_context {
+    hs_enumerate_func *f;
+    void *udata;
+};
+
+static int enumerate_enumerate_callback(hs_device *dev, void *udata)
+{
+    struct enumerate_enumerate_context *ctx = (struct enumerate_enumerate_context *)udata;
+
+    _hs_device_log(dev, "Enumerate");
+    return (*ctx->f)(dev, ctx->udata);
+}
+
+int hs_enumerate(const hs_match_spec *matches, unsigned int count, hs_enumerate_func *f,
+                 void *udata)
+{
+    assert(f);
+
+    _hs_match_helper match_helper = {0};
+    struct enumerate_enumerate_context ctx;
+    int r;
+
+    r = init_udev();
+    if (r < 0)
+        return r;
+
+    r = _hs_match_helper_init(&match_helper, matches, count);
+    if (r < 0)
+        return r;
+
+    ctx.f = f;
+    ctx.udata = udata;
+
+    r = enumerate(&match_helper, enumerate_enumerate_callback, &ctx);
+
+    _hs_match_helper_release(&match_helper);
+    return r;
+}
+
+int hs_monitor_new(const hs_match_spec *matches, unsigned int count, hs_monitor **rmonitor)
+{
+    assert(rmonitor);
+
+    hs_monitor *monitor;
+    int r;
+
+    monitor = (hs_monitor *)calloc(1, sizeof(*monitor));
+    if (!monitor) {
+        r = hs_error(HS_ERROR_MEMORY, NULL);
+        goto error;
+    }
+    monitor->wait_fd = -1;
+
+    r = _hs_match_helper_init(&monitor->match_helper, matches, count);
+    if (r < 0)
+        goto error;
+
+    r = _hs_htable_init(&monitor->devices, 64);
+    if (r < 0)
+        goto error;
+
+    r = init_udev();
+    if (r < 0)
+        goto error;
+
+    monitor->wait_fd = fcntl(common_eventfd, F_DUPFD_CLOEXEC, 0);
+    if (monitor->wait_fd < 0) {
+        r = hs_error(HS_ERROR_SYSTEM, "fcntl(F_DUPFD_CLOEXEC) failed: %s", strerror(errno));
+        goto error;
+    }
+
+    *rmonitor = monitor;
+    return 0;
+
+error:
+    hs_monitor_free(monitor);
+    return r;
+}
+
+void hs_monitor_free(hs_monitor *monitor)
+{
+    if (monitor) {
+        close(monitor->wait_fd);
+        udev_monitor_unref(monitor->udev_mon);
+
+        _hs_monitor_clear_devices(&monitor->devices);
+        _hs_htable_release(&monitor->devices);
+        _hs_match_helper_release(&monitor->match_helper);
+    }
+
+    free(monitor);
+}
+
+static int monitor_enumerate_callback(hs_device *dev, void *udata)
+{
+    hs_monitor *monitor = (hs_monitor *)udata;
+    return _hs_monitor_add(&monitor->devices, dev, NULL, NULL);
+}
+
+int hs_monitor_start(hs_monitor *monitor)
+{
+    assert(monitor);
+
+    int r;
+
+    if (monitor->udev_mon)
+        return 0;
+
+    monitor->udev_mon = udev_monitor_new_from_netlink(udev, "udev");
+    if (!monitor->udev_mon) {
+        r = hs_error(HS_ERROR_SYSTEM, "udev_monitor_new_from_netlink() failed");
+        goto error;
+    }
+
+    for (unsigned int i = 0; device_subsystems[i].subsystem; i++) {
+        if (_hs_match_helper_has_type(&monitor->match_helper, device_subsystems[i].type)) {
+            r = udev_monitor_filter_add_match_subsystem_devtype(monitor->udev_mon, device_subsystems[i].subsystem, NULL);
+            if (r < 0) {
+                r = hs_error(HS_ERROR_SYSTEM, "udev_monitor_filter_add_match_subsystem_devtype() failed");
+                goto error;
+            }
+        }
+    }
+
+    r = udev_monitor_enable_receiving(monitor->udev_mon);
+    if (r < 0) {
+        r = hs_error(HS_ERROR_SYSTEM, "udev_monitor_enable_receiving() failed");
+        goto error;
+    }
+
+    r = enumerate(&monitor->match_helper, monitor_enumerate_callback, monitor);
+    if (r < 0)
+        goto error;
+
+    /* Given the documentation of dup3() and the kernel code handling it, I'm reasonably sure
+       nothing can make this call fail. */
+    dup3(udev_monitor_get_fd(monitor->udev_mon), monitor->wait_fd, O_CLOEXEC);
+
+    return 0;
+
+error:
+    hs_monitor_stop(monitor);
+    return r;
+}
+
+void hs_monitor_stop(hs_monitor *monitor)
+{
+    assert(monitor);
+
+    if (!monitor->udev_mon)
+        return;
+
+    _hs_monitor_clear_devices(&monitor->devices);
+
+    dup3(common_eventfd, monitor->wait_fd, O_CLOEXEC);
+    udev_monitor_unref(monitor->udev_mon);
+    monitor->udev_mon = NULL;
+}
+
+hs_handle hs_monitor_get_poll_handle(const hs_monitor *monitor)
+{
+    assert(monitor);
+    return monitor->wait_fd;
+}
+
+int hs_monitor_refresh(hs_monitor *monitor, hs_enumerate_func *f, void *udata)
+{
+    assert(monitor);
+
+    struct udev_device *udev_dev;
+    int r;
+
+    if (!monitor->udev_mon)
+        return 0;
+
+    errno = 0;
+    while ((udev_dev = udev_monitor_receive_device(monitor->udev_mon))) {
+        const char *action = udev_device_get_action(udev_dev);
+
+        r = 0;
+        if (strcmp(action, "add") == 0) {
+            hs_device *dev = NULL;
+
+            r = read_device_information(udev_dev, &dev);
+            if (r > 0) {
+                r = _hs_match_helper_match(&monitor->match_helper, dev, &dev->match_udata);
+                if (r)
+                    r = _hs_monitor_add(&monitor->devices, dev, f, udata);
+            }
+
+            hs_device_unref(dev);
+        } else if (strcmp(action, "remove") == 0) {
+            _hs_monitor_remove(&monitor->devices, udev_device_get_devpath(udev_dev), f, udata);
+        }
+        udev_device_unref(udev_dev);
+        if (r)
+            return r;
+
+        errno = 0;
+    }
+    if (errno == ENOMEM)
+        return hs_error(HS_ERROR_MEMORY, NULL);
+
+    return 0;
+}
+
+int hs_monitor_list(hs_monitor *monitor, hs_enumerate_func *f, void *udata)
+{
+    return _hs_monitor_list(&monitor->devices, f, udata);
+}
+
+#endif
+
+// monitor_win32.c
+// ------------------------------------
+
+// #include "common_priv.h"
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <cfgmgr32.h>
+#include <dbt.h>
+#include <devioctl.h>
+_HS_BEGIN_C
+    #include <hidsdi.h>
+    #include <hidpi.h>
+_HS_END_C
+#include <initguid.h>
+#include <process.h>
+#include <setupapi.h>
+#include <usb.h>
+#include <usbiodef.h>
+#include <usbioctl.h>
+#include <usbuser.h>
+#include <wchar.h>
+// #include "array.h"
+// #include "device_priv.h"
+// #include "match_priv.h"
+// #include "monitor_priv.h"
+// #include "platform.h"
+
+#if defined(_MSC_VER)
+    #pragma comment(lib, "user32.lib")
+    #pragma comment(lib, "advapi32.lib")
+    #pragma comment(lib, "setupapi.lib")
+    #pragma comment(lib, "hid.lib")
+#endif
+
+enum event_type {
+    DEVICE_EVENT_ADDED,
+    DEVICE_EVENT_REMOVED
+};
+
+struct event {
+    enum event_type type;
+    char device_key[256];
+};
+
+typedef _HS_ARRAY(struct event) event_array;
+
+struct hs_monitor {
+    _hs_match_helper match_helper;
+    _hs_htable devices;
+
+    HANDLE thread;
+    HWND thread_hwnd;
+
+    HANDLE thread_event;
+    CRITICAL_SECTION events_lock;
+    event_array events;
+    event_array thread_events;
+    event_array refresh_events;
+    int thread_ret;
+};
+
+struct setup_class {
+    const char *name;
+    hs_device_type type;
+};
+
+struct device_cursor {
+    DEVINST inst;
+    char id[256];
+};
+
+enum device_cursor_relative {
+    DEVINST_RELATIVE_PARENT,
+    DEVINST_RELATIVE_SIBLING,
+    DEVINST_RELATIVE_CHILD
+};
+
+#if defined(__MINGW64_VERSION_MAJOR) && __MINGW64_VERSION_MAJOR < 4
+__declspec(dllimport) BOOLEAN NTAPI HidD_GetSerialNumberString(HANDLE HidDeviceObject,
+                                                               PVOID Buffer, ULONG BufferLength);
+__declspec(dllimport) BOOLEAN NTAPI HidD_GetPreparsedData(HANDLE HidDeviceObject,
+                                                          PHIDP_PREPARSED_DATA *PreparsedData);
+__declspec(dllimport) BOOLEAN NTAPI HidD_FreePreparsedData(PHIDP_PREPARSED_DATA PreparsedData);
+#endif
+
+#define MAX_USB_DEPTH 8
+#define MONITOR_CLASS_NAME "hs_monitor"
+
+static const struct setup_class setup_classes[] = {
+    {"Ports",    HS_DEVICE_TYPE_SERIAL},
+    {"HIDClass", HS_DEVICE_TYPE_HID}
+};
+
+static volatile LONG controllers_lock_setup;
+static CRITICAL_SECTION controllers_lock;
+static char *controllers[32];
+static unsigned int controllers_count;
+
+static bool make_device_cursor(DEVINST inst, struct device_cursor *new_cursor)
+{
+    CONFIGRET cret;
+
+    new_cursor->inst = inst;
+    cret = CM_Get_Device_IDA(inst, new_cursor->id, sizeof(new_cursor->id), 0);
+    if (cret != CR_SUCCESS) {
+        hs_log(HS_LOG_WARNING, "CM_Get_Device_ID() failed for instance 0x%lx: 0x%lx", inst, cret);
+        return false;
+    }
+
+    return true;
+}
+
+static bool make_relative_cursor(struct device_cursor *cursor,
+                                 enum device_cursor_relative relative,
+                                 struct device_cursor *new_cursor)
+{
+    DEVINST new_inst;
+    CONFIGRET cret = 0xFFFFFFFF;
+
+    switch (relative) {
+        case DEVINST_RELATIVE_PARENT: {
+            cret = CM_Get_Parent(&new_inst, cursor->inst, 0);
+            if (cret != CR_SUCCESS) {
+                hs_log(HS_LOG_DEBUG, "Cannot get parent of device '%s': 0x%lx", cursor->id, cret);
+                return false;
+            }
+        } break;
+
+        case DEVINST_RELATIVE_CHILD: {
+            cret = CM_Get_Child(&new_inst, cursor->inst, 0);
+            if (cret != CR_SUCCESS) {
+                hs_log(HS_LOG_DEBUG, "Cannot get child of device '%s': 0x%lx", cursor->id, cret);
+                return false;
+            }
+        } break;
+
+        case DEVINST_RELATIVE_SIBLING: {
+            cret = CM_Get_Sibling(&new_inst, cursor->inst, 0);
+            if (cret != CR_SUCCESS) {
+                hs_log(HS_LOG_DEBUG, "Cannot get sibling of device '%s': 0x%lx", cursor->id, cret);
+                return false;
+            }
+        } break;
+    }
+    assert(cret != 0xFFFFFFFF);
+
+    return make_device_cursor(new_inst, new_cursor);
+}
+
+static uint8_t find_controller(const char *id)
+{
+    for (unsigned int i = 0; i < controllers_count; i++) {
+        if (strcmp(controllers[i], id) == 0)
+            return (uint8_t)(i + 1);
+    }
+
+    return 0;
+}
+
+static int build_device_path(const char *id, const GUID *guid, char **rpath)
+{
+    char *path, *ptr;
+
+    path = (char *)malloc(4 + strlen(id) + 41);
+    if (!path)
+        return hs_error(HS_ERROR_MEMORY, NULL);
+
+    strcpy(path, "\\\\.\\");
+    ptr = path + 4;
+
+    while (*id) {
+        if (*id == '\\') {
+            *ptr++ = '#';
+            id++;
+        } else {
+            *ptr++ = *id++;
+        }
+    }
+
+    sprintf(ptr, "#{%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}",
+            guid->Data1, guid->Data2, guid->Data3, guid->Data4[0], guid->Data4[1],
+            guid->Data4[2], guid->Data4[3], guid->Data4[4], guid->Data4[5], guid->Data4[6], guid->Data4[7]);
+
+    *rpath = path;
+    return 0;
+}
+
+static int build_location_string(uint8_t ports[], unsigned int depth, char **rpath)
+{
+    char buf[256];
+    char *ptr;
+    size_t size;
+    char *path;
+    int r;
+
+    ptr = buf;
+    size = sizeof(buf);
+
+    ptr = strcpy(buf, "usb");
+    ptr = buf + 3;
+    size -= (size_t)(ptr - buf);
+
+    for (size_t i = 0; i < depth; i++) {
+        r = snprintf(ptr, size, "-%hhu", ports[i]);
+        assert(r >= 2 && (size_t)r < size);
+
+        ptr += r;
+        size -= (size_t)r;
+    }
+
+    path = strdup(buf);
+    if (!path)
+        return hs_error(HS_ERROR_MEMORY, NULL);
+
+    *rpath = path;
+    return 0;
+}
+
+static int wide_to_cstring(const wchar_t *wide, size_t size, char **rs)
+{
+    wchar_t *tmp = NULL;
+    char *s = NULL;
+    int len, r;
+
+    tmp = (wchar_t *)calloc(1, size + sizeof(wchar_t));
+    if (!tmp) {
+        r = hs_error(HS_ERROR_MEMORY, NULL);
+        goto cleanup;
+    }
+
+    memcpy(tmp, wide, size);
+
+    len = WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, tmp, -1, NULL, 0, NULL, NULL);
+    if (!len) {
+        r = hs_error(HS_ERROR_SYSTEM, "Failed to convert UTF-16 string to local codepage: %s",
+                     hs_win32_strerror(0));
+        goto cleanup;
+    }
+
+    s = (char *)malloc((size_t)len);
+    if (!s) {
+        r = hs_error(HS_ERROR_MEMORY, NULL);
+        goto cleanup;
+    }
+
+    len = WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, tmp, -1, s, len, NULL, NULL);
+    if (!len) {
+        r = hs_error(HS_ERROR_SYSTEM, "Failed to convert UTF-16 string to local codepage: %s",
+                     hs_win32_strerror(0));
+        goto cleanup;
+    }
+
+    *rs = s;
+    s = NULL;
+
+    r = 0;
+cleanup:
+    free(s);
+    free(tmp);
+    return r;
+}
+
+static int get_port_driverkey(HANDLE hub, uint8_t port, char **rkey)
+{
+    DWORD len;
+    USB_NODE_CONNECTION_INFORMATION_EX *node;
+    USB_NODE_CONNECTION_DRIVERKEY_NAME pseudo = {0};
+    USB_NODE_CONNECTION_DRIVERKEY_NAME *wide = NULL;
+    BOOL success;
+    int r;
+
+    len = sizeof(node) + (sizeof(USB_PIPE_INFO) * 30);
+    node = (USB_NODE_CONNECTION_INFORMATION_EX *)calloc(1, len);
+    if (!node) {
+        r = hs_error(HS_ERROR_MEMORY, NULL);
+        goto cleanup;
+    }
+
+    node->ConnectionIndex = port;
+    pseudo.ConnectionIndex = port;
+
+    success = DeviceIoControl(hub, IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX, node, len,
+                              node, len, &len, NULL);
+    if (!success) {
+        hs_log(HS_LOG_WARNING, "DeviceIoControl(IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX) failed");
+        r = 0;
+        goto cleanup;
+    }
+
+    if (node->ConnectionStatus != DeviceConnected) {
+        r = 0;
+        goto cleanup;
+    }
+
+    success = DeviceIoControl(hub, IOCTL_USB_GET_NODE_CONNECTION_DRIVERKEY_NAME, &pseudo, sizeof(pseudo),
+                              &pseudo, sizeof(pseudo), &len, NULL);
+    if (!success) {
+        hs_log(HS_LOG_WARNING, "DeviceIoControl(IOCTL_USB_GET_NODE_CONNECTION_DRIVERKEY_NAME) failed");
+        r = 0;
+        goto cleanup;
+    }
+
+    wide = (USB_NODE_CONNECTION_DRIVERKEY_NAME *)calloc(1, pseudo.ActualLength);
+    if (!wide) {
+        r = hs_error(HS_ERROR_MEMORY, NULL);
+        goto cleanup;
+    }
+
+    wide->ConnectionIndex = port;
+
+    success = DeviceIoControl(hub, IOCTL_USB_GET_NODE_CONNECTION_DRIVERKEY_NAME, wide, pseudo.ActualLength,
+                              wide, pseudo.ActualLength, &len, NULL);
+    if (!success) {
+        hs_log(HS_LOG_WARNING, "DeviceIoControl(IOCTL_USB_GET_NODE_CONNECTION_DRIVERKEY_NAME) failed");
+        r = 0;
+        goto cleanup;
+    }
+
+    r = wide_to_cstring(wide->DriverKeyName, len - sizeof(pseudo) + 1, rkey);
+    if (r < 0)
+        goto cleanup;
+
+    r = 1;
+cleanup:
+    free(wide);
+    free(node);
+    return r;
+}
+
+static int find_device_port_ioctl(const char *hub_id, const char *child_key)
+{
+    char *path = NULL;
+    HANDLE h = NULL;
+    USB_NODE_INFORMATION node;
+    DWORD len;
+    BOOL success;
+    int r;
+
+    r = build_device_path(hub_id, &GUID_DEVINTERFACE_USB_HUB, &path);
+    if (r < 0)
+        goto cleanup;
+
+    h = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        hs_log(HS_LOG_DEBUG, "Failed to open USB hub '%s': %s", path, hs_win32_strerror(0));
+        r = 0;
+        goto cleanup;
+    }
+
+    hs_log(HS_LOG_DEBUG, "Asking HUB at '%s' for port information (legacy code path)", path);
+    success = DeviceIoControl(h, IOCTL_USB_GET_NODE_INFORMATION, NULL, 0, &node, sizeof(node),
+                              &len, NULL);
+    if (!success) {
+        hs_log(HS_LOG_DEBUG, "DeviceIoControl(IOCTL_USB_GET_NODE_INFORMATION) failed");
+        r = 0;
+        goto cleanup;
+    }
+
+    for (uint8_t port = 1; port <= node.u.HubInformation.HubDescriptor.bNumberOfPorts; port++) {
+        char *key = NULL;
+
+        r = get_port_driverkey(h, port, &key);
+        if (r < 0)
+            goto cleanup;
+        if (!r)
+            continue;
+
+        if (strcmp(key, child_key) == 0) {
+            free(key);
+
+            r = port;
+            break;
+        } else {
+            free(key);
+        }
+    }
+
+cleanup:
+    if (h)
+        CloseHandle(h);
+    free(path);
+    return r;
+}
+
+static bool is_root_usb_controller(const char *id)
+{
+    static const char *const root_needles[] = {
+        "ROOT_HUB",
+        "VMUSB\\HUB" // Microsoft Virtual PC
+    };
+
+    for (size_t i = 0; i < _HS_COUNTOF(root_needles); i++) {
+        if (strstr(id, root_needles[i]))
+            return true;
+    }
+    return false;
+}
+
+static int resolve_usb_location_ioctl(struct device_cursor usb_cursor, uint8_t ports[],
+                                      struct device_cursor *roothub_cursor)
+{
+    unsigned int depth;
+
+    depth = 0;
+    do {
+        struct device_cursor parent_cursor;
+        char child_key[256];
+        DWORD child_key_len;
+        CONFIGRET cret;
+        int r;
+
+        if (!make_relative_cursor(&usb_cursor, DEVINST_RELATIVE_PARENT, &parent_cursor))
+            return 0;
+
+        child_key_len = sizeof(child_key);
+        cret = CM_Get_DevNode_Registry_PropertyA(usb_cursor.inst, CM_DRP_DRIVER, NULL,
+                                                 child_key, &child_key_len, 0);
+        if (cret != CR_SUCCESS) {
+            hs_log(HS_LOG_WARNING, "Failed to get device driver key: 0x%lx", cret);
+            return 0;
+        }
+        r = find_device_port_ioctl(parent_cursor.id, child_key);
+        if (r <= 0)
+            return r;
+        ports[depth] = (uint8_t)r;
+        hs_log(HS_LOG_DEBUG, "Found port number of '%s': %u", usb_cursor.id, ports[depth]);
+        depth++;
+
+        // We need place for the root hub index
+        if (depth == MAX_USB_DEPTH) {
+            hs_log(HS_LOG_WARNING, "Excessive USB location depth, ignoring device");
+            return 0;
+        }
+
+        usb_cursor = parent_cursor;
+    } while (!is_root_usb_controller(usb_cursor.id));
+
+    *roothub_cursor = usb_cursor;
+    return (int)depth;
+}
+
+static int resolve_usb_location_cfgmgr(struct device_cursor usb_cursor, uint8_t ports[],
+                                       struct device_cursor *roothub_cursor)
+{
+    unsigned int depth;
+
+    depth = 0;
+    do {
+        char location_buf[256];
+        DWORD location_len;
+        unsigned int location_port;
+        CONFIGRET cret;
+
+        // Extract port from CM_DRP_LOCATION_INFORMATION (Vista and later versions)
+        location_len = sizeof(location_buf);
+        cret = CM_Get_DevNode_Registry_PropertyA(usb_cursor.inst, CM_DRP_LOCATION_INFORMATION,
+                                                 NULL, location_buf, &location_len, 0);
+        if (cret != CR_SUCCESS) {
+            hs_log(HS_LOG_DEBUG, "No location information on this device node");
+            return 0;
+        }
+        location_port = 0;
+        sscanf(location_buf, "Port_#%04u", &location_port);
+        if (!location_port)
+            return 0;
+        hs_log(HS_LOG_DEBUG, "Found port number of '%s': %u", usb_cursor.id, location_port);
+        ports[depth++] = (uint8_t)location_port;
+
+        // We need place for the root hub index
+        if (depth == MAX_USB_DEPTH) {
+            hs_log(HS_LOG_WARNING, "Excessive USB location depth, ignoring device");
+            return 0;
+        }
+
+        if (!make_relative_cursor(&usb_cursor, DEVINST_RELATIVE_PARENT, &usb_cursor))
+            return 0;
+    } while (!is_root_usb_controller(usb_cursor.id));
+
+    *roothub_cursor = usb_cursor;
+    return (int)depth;
+}
+
+static int find_device_location(const struct device_cursor *dev_cursor, uint8_t ports[])
+{
+    struct device_cursor usb_cursor;
+    struct device_cursor roothub_cursor;
+    int depth;
+
+    // Find the USB device instance
+    usb_cursor = *dev_cursor;
+    while (strncmp(usb_cursor.id, "USB\\", 4) != 0 || strstr(usb_cursor.id, "&MI_")) {
+        if (!make_relative_cursor(&usb_cursor, DEVINST_RELATIVE_PARENT, &usb_cursor))
+            return 0;
+    }
+
+    /* Browse the USB tree to resolve USB ports. Try the CfgMgr method first, only
+       available on Windows Vista and later versions. It may also fail with third-party
+       USB controller drivers, typically USB 3.0 host controllers before Windows 10. */
+    depth = 0;
+    if (!getenv("LIBHS_WIN32_FORCE_XP_LOCATION_CODE")) {
+        depth = resolve_usb_location_cfgmgr(usb_cursor, ports, &roothub_cursor);
+        if (depth < 0)
+            return depth;
+    }
+    if (!depth) {
+        hs_log(HS_LOG_DEBUG, "Using legacy code for location of '%s'", dev_cursor->id);
+        depth = resolve_usb_location_ioctl(usb_cursor, ports, &roothub_cursor);
+        if (depth < 0)
+            return depth;
+    }
+    if (!depth) {
+        hs_log(HS_LOG_DEBUG, "Cannot resolve USB location for '%s'", dev_cursor->id);
+        return 0;
+    }
+
+    // Resolve the USB controller ID
+    ports[depth] = find_controller(roothub_cursor.id);
+    if (!ports[depth]) {
+        hs_log(HS_LOG_WARNING, "Unknown USB host controller '%s'", roothub_cursor.id);
+        return 0;
+    }
+    hs_log(HS_LOG_DEBUG, "Found controller ID for '%s': %u", roothub_cursor.id, ports[depth]);
+    depth++;
+
+    // The ports are in the wrong order
+    for (int i = 0; i < depth / 2; i++) {
+        uint8_t tmp = ports[i];
+        ports[i] = ports[depth - i - 1];
+        ports[depth - i - 1] = tmp;
+    }
+
+    return depth;
+}
+
+static int read_hid_properties(hs_device *dev, const USB_DEVICE_DESCRIPTOR *desc)
+{
+    HANDLE h = NULL;
+    int r;
+
+    h = CreateFileA(dev->path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        hs_log(HS_LOG_WARNING, "Cannot open HID device '%s': %s", dev->path, hs_win32_strerror(0));
+        r = 0;
+        goto cleanup;
+    }
+
+#define READ_HID_PROPERTY(index, func, dest) \
+        if (index) { \
+            wchar_t wbuf[256]; \
+            BOOL bret; \
+            \
+            bret = func(h, wbuf, sizeof(wbuf)); \
+            if (bret) { \
+                wbuf[_HS_COUNTOF(wbuf) - 1] = 0; \
+                r = wide_to_cstring(wbuf, wcslen(wbuf) * sizeof(wchar_t), (dest)); \
+                if (r < 0) \
+                    goto cleanup; \
+            } else { \
+                hs_log(HS_LOG_WARNING, "Function %s() failed despite non-zero string index", #func); \
+            } \
+        }
+
+    READ_HID_PROPERTY(desc->iManufacturer, HidD_GetManufacturerString, &dev->manufacturer_string);
+    READ_HID_PROPERTY(desc->iProduct, HidD_GetProductString, &dev->product_string);
+    READ_HID_PROPERTY(desc->iSerialNumber, HidD_GetSerialNumberString, &dev->serial_number_string);
+
+#undef READ_HID_PROPERTY
+
+    {
+        // semi-hidden Hungarian pointers? Really , Microsoft?
+        PHIDP_PREPARSED_DATA pp;
+        HIDP_CAPS caps;
+        LONG lret;
+
+        lret = HidD_GetPreparsedData(h, &pp);
+        if (!lret) {
+            hs_log(HS_LOG_WARNING, "HidD_GetPreparsedData() failed on '%s", dev->path);
+            r = 0;
+            goto cleanup;
+        }
+        lret = HidP_GetCaps(pp, &caps);
+        HidD_FreePreparsedData(pp);
+        if (lret != HIDP_STATUS_SUCCESS) {
+            hs_log(HS_LOG_WARNING, "Invalid HID descriptor from '%s", dev->path);
+            r = 0;
+            goto cleanup;
+        }
+
+        dev->u.hid.usage_page = caps.UsagePage;
+        dev->u.hid.usage = caps.Usage;
+        dev->u.hid.max_input_len = caps.InputReportByteLength ? (caps.InputReportByteLength - 1) : 0;
+        dev->u.hid.max_output_len = caps.OutputReportByteLength ? (caps.OutputReportByteLength - 1) : 0;
+        dev->u.hid.max_feature_len = caps.FeatureReportByteLength ? (caps.FeatureReportByteLength - 1) : 0;
+    }
+
+    r = 1;
+cleanup:
+    if (h)
+        CloseHandle(h);
+    return r;
+}
+
+static int get_string_descriptor(HANDLE hub, uint8_t port, uint8_t index, char **rs)
+{
+    // A bit ugly, but using USB_DESCRIPTOR_REQUEST directly triggers a C2229 on MSVC
+    struct {
+        // USB_DESCRIPTOR_REQUEST
+        struct {
+            ULONG  ConnectionIndex;
+            struct {
+                UCHAR bmRequest;
+                UCHAR bRequest;
+                USHORT wValue;
+                USHORT wIndex;
+                USHORT wLength;
+            } SetupPacket;
+        } req;
+
+        // Filled by DeviceIoControl
+        struct {
+            UCHAR bLength;
+            UCHAR bDescriptorType;
+            WCHAR bString[MAXIMUM_USB_STRING_LENGTH];
+        } desc;
+    } rq;
+    DWORD desc_len = 0;
+    char *s;
+    BOOL success;
+    int r;
+
+    memset(&rq, 0, sizeof(rq));
+    rq.req.ConnectionIndex = port;
+    rq.req.SetupPacket.wValue = (USHORT)((USB_STRING_DESCRIPTOR_TYPE << 8) | index);
+    rq.req.SetupPacket.wIndex = 0x409;
+    rq.req.SetupPacket.wLength = sizeof(rq.desc);
+
+    success = DeviceIoControl(hub, IOCTL_USB_GET_DESCRIPTOR_FROM_NODE_CONNECTION, &rq,
+                              sizeof(rq), &rq, sizeof(rq), &desc_len, NULL);
+    if (!success || desc_len < 2 || rq.desc.bDescriptorType != USB_STRING_DESCRIPTOR_TYPE ||
+            rq.desc.bLength != desc_len - sizeof(rq.req) || rq.desc.bLength % 2 != 0) {
+        hs_log(HS_LOG_DEBUG, "Invalid string descriptor %u", index);
+        return 0;
+    }
+
+    r = wide_to_cstring(rq.desc.bString, desc_len - sizeof(USB_DESCRIPTOR_REQUEST), &s);
+    if (r < 0)
+        return r;
+
+    *rs = s;
+    return 0;
+}
+
+static int read_device_properties(hs_device *dev, const struct device_cursor *dev_cursor, uint8_t port)
+{
+    struct device_cursor intf_cursor, usb_cursor, hub_cursor;
+    unsigned int vid, pid, iface_number;
+    char *path = NULL;
+    HANDLE hub = NULL;
+    DWORD len;
+    USB_NODE_CONNECTION_INFORMATION_EX *node = NULL;
+    BOOL success;
+    int r;
+
+    // Find relevant device instances: interface, device, HUB
+    intf_cursor = *dev_cursor;
+    while (strncmp(intf_cursor.id, "USB\\", 4) != 0) {
+        if (!make_relative_cursor(&intf_cursor, DEVINST_RELATIVE_PARENT, &intf_cursor)) {
+            r = 0;
+            goto cleanup;
+        }
+    }
+    if (strstr(intf_cursor.id, "&MI_")) {
+        if (!make_relative_cursor(&intf_cursor, DEVINST_RELATIVE_PARENT, &usb_cursor)) {
+            r = 0;
+            goto cleanup;
+        }
+    } else {
+        usb_cursor = intf_cursor;
+    }
+    if (!make_relative_cursor(&usb_cursor, DEVINST_RELATIVE_PARENT, &hub_cursor)) {
+        r = 0;
+        goto cleanup;
+    }
+
+    // Make device key (used for removal, among other things)
+    dev->key = strdup(usb_cursor.id);
+    if (!dev->key) {
+        r = hs_error(HS_ERROR_MEMORY, NULL);
+        goto cleanup;
+    }
+
+    /* h and hh type modifier characters are not known to msvcrt, and MinGW issues warnings
+       if we try to use them. Use temporary unsigned int variables to get around that. */
+    iface_number = 0;
+    r = sscanf(intf_cursor.id, "USB\\VID_%04x&PID_%04x&MI_%02u", &vid, &pid, &iface_number);
+    if (r < 2) {
+        hs_log(HS_LOG_WARNING, "Failed to parse USB properties from '%s'", intf_cursor.id);
+        r = 0;
+        goto cleanup;
+    }
+    dev->vid = (uint16_t)vid;
+    dev->pid = (uint16_t)pid;
+    dev->iface_number = (uint8_t)iface_number;
+
+    r = build_device_path(hub_cursor.id, &GUID_DEVINTERFACE_USB_HUB, &path);
+    if (r < 0)
+        goto cleanup;
+
+    hub = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_WRITE | FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (hub == INVALID_HANDLE_VALUE) {
+        hs_log(HS_LOG_DEBUG, "Cannot open parent hub device at '%s', ignoring device properties for '%s'",
+               path, dev_cursor->id);
+        r = 1;
+        goto cleanup;
+    }
+
+    len = sizeof(node) + (sizeof(USB_PIPE_INFO) * 30);
+    node = (USB_NODE_CONNECTION_INFORMATION_EX *)calloc(1, len);
+    if (!node) {
+        r = hs_error(HS_ERROR_MEMORY, NULL);
+        goto cleanup;
+    }
+
+    node->ConnectionIndex = port;
+    success = DeviceIoControl(hub, IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX, node, len,
+                              node, len, &len, NULL);
+    if (!success) {
+        hs_log(HS_LOG_DEBUG, "Failed to interrogate hub device at '%s' for device '%s'",
+               path, dev_cursor->id);
+        r = 1;
+        goto cleanup;
+    }
+
+    // Get additional properties
+    dev->bcd_device = node->DeviceDescriptor.bcdDevice;
+
+    /* Descriptor requests to USB devices underlying HID devices fail most (all?) of the time,
+       so we need a different technique here. We still need the device descriptor because the
+       HidD_GetXString() functions sometime return garbage (at least on XP) when the string
+       index is 0. */
+    if (dev->type == HS_DEVICE_TYPE_HID) {
+        r = read_hid_properties(dev, &node->DeviceDescriptor);
+        goto cleanup;
+    }
+
+#define READ_STRING_DESCRIPTOR(index, var) \
+        if (index) { \
+            r = get_string_descriptor(hub, port, (index), (var)); \
+            if (r < 0) \
+                goto cleanup; \
+        }
+
+    READ_STRING_DESCRIPTOR(node->DeviceDescriptor.iManufacturer, &dev->manufacturer_string);
+    READ_STRING_DESCRIPTOR(node->DeviceDescriptor.iProduct, &dev->product_string);
+    READ_STRING_DESCRIPTOR(node->DeviceDescriptor.iSerialNumber, &dev->serial_number_string);
+
+#undef READ_STRING_DESCRIPTOR
+
+    r = 1;
+cleanup:
+    free(node);
+    if (hub)
+        CloseHandle(hub);
+    free(path);
+    return r;
+}
+
+static int get_device_comport(DEVINST inst, char **rnode)
+{
+    HKEY key;
+    char buf[32];
+    DWORD len;
+    char *node;
+    CONFIGRET cret;
+    LONG ret;
+    int r;
+
+    cret = CM_Open_DevNode_Key(inst, KEY_READ, 0, RegDisposition_OpenExisting, &key, CM_REGISTRY_HARDWARE);
+    if (cret != CR_SUCCESS) {
+        hs_log(HS_LOG_WARNING, "CM_Open_DevNode_Key() failed: 0x%lu", cret);
+        return 0;
+    }
+
+    len = (DWORD)sizeof(buf);
+    ret = RegGetValueA(key, "", "PortName", RRF_RT_REG_SZ, NULL, (BYTE *)buf, &len);
+    RegCloseKey(key);
+    if (ret != ERROR_SUCCESS) {
+        if (ret != ERROR_FILE_NOT_FOUND)
+            hs_log(HS_LOG_WARNING, "RegQueryValue() failed: %ld", ret);
+        return 0;
+    }
+    len--;
+
+    // You need the \\.\ prefix to open COM ports beyond COM9
+    r = _hs_asprintf(&node, "%s%s", len > 4 ? "\\\\.\\" : "", buf);
+    if (r < 0)
+        return hs_error(HS_ERROR_MEMORY, NULL);
+
+    *rnode = node;
+    return 1;
+}
+
+static int find_device_node(hs_device *dev, const struct device_cursor *dev_cursor)
+{
+    int r;
+
+    /* GUID_DEVINTERFACE_COMPORT only works for real COM ports... Haven't found any way to
+       list virtual (USB) serial device interfaces, so instead list USB devices and consider
+       them serial if registry key "PortName" is available (and use its value as device node). */
+    if (strncmp(dev_cursor->id, "USB\\", 4) == 0 || strncmp(dev_cursor->id, "FTDIBUS\\", 8) == 0) {
+        r = get_device_comport(dev_cursor->inst, &dev->path);
+        if (!r) {
+            hs_log(HS_LOG_DEBUG, "Device '%s' has no 'PortName' registry property", dev_cursor->id);
+            return r;
+        }
+        if (r < 0)
+            return r;
+
+        dev->type = HS_DEVICE_TYPE_SERIAL;
+    } else if (strncmp(dev_cursor->id, "HID\\", 4) == 0) {
+        static GUID hid_interface_guid;
+        if (!hid_interface_guid.Data1)
+            HidD_GetHidGuid(&hid_interface_guid);
+
+        r = build_device_path(dev_cursor->id, &hid_interface_guid, &dev->path);
+        if (r < 0)
+            return r;
+
+        dev->type = HS_DEVICE_TYPE_HID;
+    } else {
+        hs_log(HS_LOG_DEBUG, "Unknown device type for '%s'", dev_cursor->id);
+        return 0;
+    }
+
+    return 1;
+}
+
+static int process_win32_device(DEVINST inst, hs_device **rdev)
+{
+    struct device_cursor dev_cursor;
+    hs_device *dev = NULL;
+    uint8_t ports[MAX_USB_DEPTH];
+    unsigned int depth;
+    int r;
+
+    if (!make_device_cursor(inst, &dev_cursor)) {
+        r = 0;
+        goto cleanup;
+    }
+
+    dev = (hs_device *)calloc(1, sizeof(*dev));
+    if (!dev) {
+        r = hs_error(HS_ERROR_MEMORY, NULL);
+        goto cleanup;
+    }
+    dev->refcount = 1;
+    dev->status = HS_DEVICE_STATUS_ONLINE;
+
+    // HID devices can have multiple collections for each interface, ignore them
+    if (strncmp(dev_cursor.id, "HID\\", 4) == 0) {
+        const char *ptr = strstr(dev_cursor.id, "&COL");
+        if (ptr && strncmp(ptr, "&COL01\\",  7) != 0) {
+            hs_log(HS_LOG_DEBUG, "Ignoring duplicate HID collection device '%s'", dev_cursor.id);
+            r = 0;
+            goto cleanup;
+        }
+    }
+
+    hs_log(HS_LOG_DEBUG, "Examining device node '%s'", dev_cursor.id);
+
+    // Ignore composite devices
+    {
+        char class[512];
+        DWORD class_len;
+        CONFIGRET cret;
+
+        class_len = sizeof(class);
+        cret = CM_Get_DevNode_Registry_PropertyA(inst, CM_DRP_CLASSGUID, NULL, class, &class_len, 0);
+        if (cret != CR_SUCCESS) {
+            hs_log(HS_LOG_WARNING, "Failed to get device class GUID: 0x%lx", cret);
+            r = 0;
+            goto cleanup;
+        }
+
+        if (!strcasecmp(class, "{36fc9e60-c465-11cf-8056-444553540000}")) {
+            hs_log(HS_LOG_DEBUG, "Ignoring composite device");
+            r = 0;
+            goto cleanup;
+        }
+    }
+
+    r = find_device_node(dev, &dev_cursor);
+    if (r <= 0)
+        goto cleanup;
+
+    r = find_device_location(&dev_cursor, ports);
+    if (r <= 0)
+        goto cleanup;
+    depth = (unsigned int)r;
+
+    r = read_device_properties(dev, &dev_cursor, ports[depth - 1]);
+    if (r <= 0)
+        goto cleanup;
+
+    r = build_location_string(ports, depth, &dev->location);
+    if (r < 0)
+        goto cleanup;
+
+    *rdev = dev;
+    dev = NULL;
+    r = 1;
+
+cleanup:
+    hs_device_unref(dev);
+    return r;
+}
+
+static void free_controllers(void)
+{
+    for (unsigned int i = 0; i < controllers_count; i++)
+        free(controllers[i]);
+    DeleteCriticalSection(&controllers_lock);
+}
+
+static int populate_controllers(void)
+{
+    HDEVINFO set = NULL;
+    SP_DEVINFO_DATA info;
+    int r;
+
+    if (controllers_count)
+        return 0;
+
+    if (controllers_lock_setup != 2) {
+        if (!InterlockedCompareExchange(&controllers_lock_setup, 1, 0)) {
+            InitializeCriticalSection(&controllers_lock);
+            atexit(free_controllers);
+            controllers_lock_setup = 2;
+        } else {
+            while (controllers_lock_setup != 2)
+                continue;
+        }
+    }
+
+    EnterCriticalSection(&controllers_lock);
+
+    if (controllers_count) {
+        r = 0;
+        goto cleanup;
+    }
+
+    hs_log(HS_LOG_DEBUG, "Listing USB host controllers and root hubs");
+
+    set = SetupDiGetClassDevs(&GUID_DEVINTERFACE_USB_HOST_CONTROLLER, NULL, NULL,
+                              DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (!set) {
+        r = hs_error(HS_ERROR_SYSTEM, "SetupDiGetClassDevs() failed: %s", hs_win32_strerror(0));
+        goto cleanup;
+    }
+
+    info.cbSize = sizeof(info);
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(set, i, &info); i++) {
+        struct device_cursor cursor;
+
+        if (controllers_count == _HS_COUNTOF(controllers)) {
+            hs_log(HS_LOG_WARNING, "Reached maximum controller ID %d, ignoring", UINT8_MAX);
+            break;
+        }
+
+        if (!make_device_cursor(info.DevInst, &cursor))
+            continue;
+        if (!make_relative_cursor(&cursor, DEVINST_RELATIVE_CHILD, &cursor))
+            continue;
+        if (!is_root_usb_controller(cursor.id)) {
+            hs_log(HS_LOG_WARNING, "Expected root hub device at '%s'", cursor.id);
+            continue;
+        }
+
+        controllers[controllers_count] = strdup(cursor.id);
+        if (!controllers[controllers_count]) {
+            r = hs_error(HS_ERROR_MEMORY, NULL);
+            goto cleanup;
+        }
+        hs_log(HS_LOG_DEBUG, "Found root USB hub '%s' with ID %u", cursor.id, controllers_count);
+        controllers_count++;
+    }
+
+    r = 0;
+cleanup:
+    LeaveCriticalSection(&controllers_lock);
+    if (set)
+        SetupDiDestroyDeviceInfoList(set);
+    return r;
+}
+
+static int enumerate_setup_class(const GUID *guid, const _hs_match_helper *match_helper,
+                                 hs_enumerate_func *f, void *udata)
+{
+    HDEVINFO set = NULL;
+    SP_DEVINFO_DATA info;
+    hs_device *dev = NULL;
+    int r;
+
+    set = SetupDiGetClassDevs(guid, NULL, NULL, DIGCF_PRESENT);
+    if (!set) {
+        r = hs_error(HS_ERROR_SYSTEM, "SetupDiGetClassDevs() failed: %s", hs_win32_strerror(0));
+        goto cleanup;
+    }
+
+    info.cbSize = sizeof(info);
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(set, i, &info); i++) {
+        r = process_win32_device(info.DevInst, &dev);
+        if (r < 0)
+            goto cleanup;
+        if (!r)
+            continue;
+
+        if (_hs_match_helper_match(match_helper, dev, &dev->match_udata)) {
+            r = (*f)(dev, udata);
+            hs_device_unref(dev);
+            if (r)
+                goto cleanup;
+        } else {
+            hs_device_unref(dev);
+        }
+    }
+
+    r = 0;
+cleanup:
+    if (set)
+        SetupDiDestroyDeviceInfoList(set);
+    return r;
+}
+
+int enumerate(_hs_match_helper *match_helper, hs_enumerate_func *f, void *udata)
+{
+    int r;
+
+    r = populate_controllers();
+    if (r < 0)
+        return r;
+
+    for (unsigned int i = 0; i < _HS_COUNTOF(setup_classes); i++) {
+        if (_hs_match_helper_has_type(match_helper, setup_classes[i].type)) {
+            GUID guids[8];
+            DWORD guids_count;
+            BOOL success;
+
+            success = SetupDiClassGuidsFromNameA(setup_classes[i].name, guids, _HS_COUNTOF(guids),
+                                                 &guids_count);
+            if (!success)
+                return hs_error(HS_ERROR_SYSTEM, "SetupDiClassGuidsFromName('%s') failed: %s",
+                                setup_classes[i].name, hs_win32_strerror(0));
+
+            for (unsigned int j = 0; j < guids_count; j++) {
+                r = enumerate_setup_class(&guids[j], match_helper, f, udata);
+                if (r)
+                    return r;
+            }
+        }
+    }
+
+    return 0;
+}
+
+struct enumerate_enumerate_context {
+    hs_enumerate_func *f;
+    void *udata;
+};
+
+static int enumerate_enumerate_callback(hs_device *dev, void *udata)
+{
+    struct enumerate_enumerate_context *ctx = (struct enumerate_enumerate_context *)udata;
+
+    _hs_device_log(dev, "Enumerate");
+    return (*ctx->f)(dev, ctx->udata);
+}
+
+int hs_enumerate(const hs_match_spec *matches, unsigned int count, hs_enumerate_func *f, void *udata)
+{
+    assert(f);
+
+    _hs_match_helper match_helper = {0};
+    struct enumerate_enumerate_context ctx;
+    int r;
+
+    r = _hs_match_helper_init(&match_helper, matches, count);
+    if (r < 0)
+        return r;
+
+    ctx.f = f;
+    ctx.udata = udata;
+
+    r = enumerate(&match_helper, enumerate_enumerate_callback, &ctx);
+
+    _hs_match_helper_release(&match_helper);
+    return r;
+}
+
+static int post_event(hs_monitor *monitor, enum event_type event_type, const char *id)
+{
+    size_t id_len;
+    struct event *event;
+    int r;
+
+    /* Extract the device instance ID part.
+       - in: \\?\USB#Vid_2341&Pid_0042#85336303532351101252#{a5dcbf10-6530-11d2-901f-00c04fb951ed}
+       - out: USB#Vid_2341&Pid_0042#85336303532351101252
+       You may notice that paths from RegisterDeviceNotification() seem to start with '\\?\',
+       which according to MSDN is the file namespace, not the device namespace '\\.\'. Oh well. */
+    if (strncmp(id, "\\\\?\\", 4) == 0
+            || strncmp(id, "\\\\.\\", 4) == 0
+            || strncmp(id, "##.#", 4) == 0
+            || strncmp(id, "##?#", 4) == 0)
+        id += 4;
+    id_len = strlen(id);
+    if (id_len >= 39 && id[id_len - 39] == '#' && id[id_len - 38] == '{' && id[id_len - 1] == '}')
+        id_len -= 39;
+
+    if (id_len >= sizeof(event->device_key)) {
+        hs_log(HS_LOG_WARNING, "Device instance ID string '%s' is too long, ignoring", id);
+        return 0;
+    }
+    r = _hs_array_grow(&monitor->thread_events, 1);
+    if (r < 0)
+        return r;
+    event = &monitor->thread_events.values[monitor->thread_events.count];
+    event->type = event_type;
+    memcpy(event->device_key, id, id_len);
+    event->device_key[id_len] = 0;
+    monitor->thread_events.count++;
+
+    /* Normalize device instance ID, uppercase and replace '#' with '\'. Could not do it on msg,
+       Windows may not like it. Maybe, not sure so don't try. */
+    for (char *ptr = event->device_key; *ptr; ptr++) {
+        if (*ptr == '#') {
+            *ptr = '\\';
+        } else if (*ptr >= 97 && *ptr <= 122) {
+            *ptr = (char)(*ptr - 32);
+        }
+    }
+
+    /* On Windows 7 (and maybe Windows 8), we don't get notifications for individual
+       interfaces in composite devices. We need to search for them. */
+    if (event_type == DEVICE_EVENT_ADDED && hs_win32_version() < HS_WIN32_VERSION_10) {
+        DEVINST inst;
+        CONFIGRET cret;
+
+        cret = CM_Locate_DevNodeA(&inst, (DEVINSTID)event->device_key, CM_LOCATE_DEVNODE_NORMAL);
+        if (cret != CR_SUCCESS) {
+            hs_log(HS_LOG_DEBUG, "Device node '%s' does not exist: 0x%lx", event->device_key, cret);
+            return 0;
+        }
+
+        struct device_cursor child_cursor;
+        if (!make_device_cursor(inst, &child_cursor))
+            return 0;
+        if (!make_relative_cursor(&child_cursor, DEVINST_RELATIVE_CHILD, &child_cursor))
+            return 0;
+
+        do {
+            r = post_event(monitor, DEVICE_EVENT_ADDED, child_cursor.id);
+            if (r < 0)
+                return r;
+        } while (make_relative_cursor(&child_cursor, DEVINST_RELATIVE_SIBLING, &child_cursor));
+    }
+
+    return 0;
+}
+
+static LRESULT __stdcall window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
+{
+    hs_monitor *monitor = (hs_monitor *)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+    int r;
+
+    switch (msg) {
+        case WM_DEVICECHANGE: {
+            DEV_BROADCAST_DEVICEINTERFACE_A *msg2 = (DEV_BROADCAST_DEVICEINTERFACE_A *)lparam;
+
+            if (msg2->dbcc_devicetype != DBT_DEVTYP_DEVICEINTERFACE)
+                break;
+
+            r = 0;
+            switch (wparam) {
+                case DBT_DEVICEARRIVAL: {
+                    r = post_event(monitor, DEVICE_EVENT_ADDED, msg2->dbcc_name);
+                } break;
+
+                case DBT_DEVICEREMOVECOMPLETE: {
+                    r = post_event(monitor, DEVICE_EVENT_REMOVED, msg2->dbcc_name);
+                } break;
+            }
+
+            if (!r) {
+                UINT_PTR timer;
+
+                timer = SetTimer(hwnd, 1, 100, NULL);
+                if (!timer)
+                    r = hs_error(HS_ERROR_SYSTEM, "SetTimer() failed: %s", hs_win32_strerror(0));
+            }
+
+            if (r < 0) {
+                EnterCriticalSection(&monitor->events_lock);
+                monitor->thread_ret = r;
+                SetEvent(monitor->thread_event);
+                LeaveCriticalSection(&monitor->events_lock);
+            }
+        } break;
+
+        case WM_TIMER: {
+            if (CMP_WaitNoPendingInstallEvents(0) == WAIT_OBJECT_0) {
+                KillTimer(hwnd, 1);
+
+                EnterCriticalSection(&monitor->events_lock);
+                r = _hs_array_grow(&monitor->events, monitor->thread_events.count);
+                if (r < 0) {
+                    monitor->thread_ret = r;
+                } else {
+                    memcpy(monitor->events.values + monitor->events.count,
+                           monitor->thread_events.values,
+                           monitor->thread_events.count * sizeof(*monitor->thread_events.values));
+                    monitor->events.count += monitor->thread_events.count;
+                    _hs_array_release(&monitor->thread_events);
+                }
+                SetEvent(monitor->thread_event);
+                LeaveCriticalSection(&monitor->events_lock);
+            }
+        } break;
+
+        case WM_CLOSE: {
+            PostQuitMessage(0);
+        } break;
+    }
+
+    return DefWindowProcA(hwnd, msg, wparam, lparam);
+}
+
+static void unregister_monitor_class(void)
+{
+    UnregisterClassA(MONITOR_CLASS_NAME, GetModuleHandle(NULL));
+}
+
+static unsigned int __stdcall monitor_thread(void *udata)
+{
+    _HS_UNUSED(udata);
+
+    hs_monitor *monitor = (hs_monitor *)udata;
+
+    WNDCLASSEXA cls = {0};
+    ATOM cls_atom;
+    DEV_BROADCAST_DEVICEINTERFACE_A filter = {0};
+    HDEVNOTIFY notify_handle = NULL;
+    MSG msg;
+    int r;
+
+    cls.cbSize = sizeof(cls);
+    cls.hInstance = GetModuleHandle(NULL);
+    cls.lpszClassName = MONITOR_CLASS_NAME;
+    cls.lpfnWndProc = window_proc;
+
+    /* If this fails, CreateWindow() will fail too so we can ignore errors here. This
+       also takes care of any failure that may result from the class already existing. */
+    cls_atom = RegisterClassExA(&cls);
+    if (cls_atom)
+        atexit(unregister_monitor_class);
+
+    monitor->thread_hwnd = CreateWindowA(MONITOR_CLASS_NAME, MONITOR_CLASS_NAME, 0, 0, 0, 0, 0,
+                                         HWND_MESSAGE, NULL, NULL, NULL);
+    if (!monitor->thread_hwnd) {
+        r = hs_error(HS_ERROR_SYSTEM, "CreateWindow() failed: %s", hs_win32_strerror(0));
+        goto cleanup;
+    }
+
+    SetLastError(0);
+    SetWindowLongPtr(monitor->thread_hwnd, GWLP_USERDATA, (LONG_PTR)monitor);
+    if (GetLastError()) {
+        r = hs_error(HS_ERROR_SYSTEM, "SetWindowLongPtr() failed: %s", hs_win32_strerror(0));
+        goto cleanup;
+    }
+
+    filter.dbcc_size = sizeof(filter);
+    filter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
+
+    /* We monitor everything because I cannot find an interface class to detect
+       serial devices within an IAD, and RegisterDeviceNotification() does not
+       support device setup class filtering. */
+    notify_handle = RegisterDeviceNotificationA(monitor->thread_hwnd, &filter,
+                                                DEVICE_NOTIFY_WINDOW_HANDLE | DEVICE_NOTIFY_ALL_INTERFACE_CLASSES);
+    if (!notify_handle) {
+        r = hs_error(HS_ERROR_SYSTEM, "RegisterDeviceNotification() failed: %s", hs_win32_strerror(0));
+        goto cleanup;
+    }
+
+    /* Our fake window is created and ready to receive device notifications,
+       hs_monitor_new() can go on. */
+    SetEvent(monitor->thread_event);
+
+    /* As it turns out, GetMessage() cannot fail if the parameters are correct.
+       https://blogs.msdn.microsoft.com/oldnewthing/20130322-00/?p=4873/ */
+    while (GetMessage(&msg, NULL, 0, 0) != 0) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    r = 0;
+cleanup:
+    if (notify_handle)
+        UnregisterDeviceNotification(notify_handle);
+    if (monitor->thread_hwnd)
+        DestroyWindow(monitor->thread_hwnd);
+    if (r < 0) {
+        monitor->thread_ret = r;
+        SetEvent(monitor->thread_event);
+    }
+    return 0;
+}
+
+static int monitor_enumerate_callback(hs_device *dev, void *udata)
+{
+    hs_monitor *monitor = (hs_monitor *)udata;
+    return _hs_monitor_add(&monitor->devices, dev, NULL, NULL);
+}
+
+/* Monitoring device changes on Windows involves a window to receive device notifications on the
+   thread message queue. Unfortunately we can't poll on message queues so instead, we make a
+   background thread to get device notifications, and tell us about it using Win32 events which
+   we can poll. */
+int hs_monitor_new(const hs_match_spec *matches, unsigned int count, hs_monitor **rmonitor)
+{
+    assert(rmonitor);
+
+    hs_monitor *monitor;
+    int r;
+
+    monitor = (hs_monitor *)calloc(1, sizeof(*monitor));
+    if (!monitor) {
+        r = hs_error(HS_ERROR_MEMORY, NULL);
+        goto error;
+    }
+
+    r = _hs_match_helper_init(&monitor->match_helper, matches, count);
+    if (r < 0)
+        goto error;
+
+    r = _hs_htable_init(&monitor->devices, 64);
+    if (r < 0)
+        goto error;
+
+    InitializeCriticalSection(&monitor->events_lock);
+    monitor->thread_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (!monitor->thread_event) {
+        r = hs_error(HS_ERROR_SYSTEM, "CreateEvent() failed: %s", hs_win32_strerror(0));
+        goto error;
+    }
+
+    *rmonitor = monitor;
+    return 0;
+
+error:
+    hs_monitor_free(monitor);
+    return r;
+}
+
+void hs_monitor_free(hs_monitor *monitor)
+{
+    if (monitor) {
+        hs_monitor_stop(monitor);
+
+        DeleteCriticalSection(&monitor->events_lock);
+        if (monitor->thread_event)
+            CloseHandle(monitor->thread_event);
+
+        _hs_monitor_clear_devices(&monitor->devices);
+        _hs_htable_release(&monitor->devices);
+        _hs_match_helper_release(&monitor->match_helper);
+    }
+
+    free(monitor);
+}
+
+hs_handle hs_monitor_get_poll_handle(const hs_monitor *monitor)
+{
+    assert(monitor);
+    return monitor->thread_event;
+}
+
+int hs_monitor_start(hs_monitor *monitor)
+{
+    assert(monitor);
+    assert(!monitor->thread);
+
+    int r;
+
+    if (monitor->thread)
+        return 0;
+
+    /* We can't create our fake window here, because the messages would be posted to this thread's
+       message queue and not to the monitoring thread. So instead, the background thread creates
+       its own window and we wait for it to signal us before we continue. */
+    monitor->thread = (HANDLE)_beginthreadex(NULL, 0, monitor_thread, monitor, 0, NULL);
+    if (!monitor->thread) {
+        r = hs_error(HS_ERROR_SYSTEM, "_beginthreadex() failed: %s", hs_win32_strerror(0));
+        goto error;
+    }
+
+    WaitForSingleObject(monitor->thread_event, INFINITE);
+    if (monitor->thread_ret < 0) {
+        r = monitor->thread_ret;
+        goto error;
+    }
+    ResetEvent(monitor->thread_event);
+
+    r = enumerate(&monitor->match_helper, monitor_enumerate_callback, monitor);
+    if (r < 0)
+        goto error;
+
+    return 0;
+
+error:
+    hs_monitor_stop(monitor);
+    return r;
+}
+
+void hs_monitor_stop(hs_monitor *monitor)
+{
+    assert(monitor);
+
+    if (!monitor->thread)
+        return;
+
+    _hs_monitor_clear_devices(&monitor->devices);
+
+    if (monitor->thread_hwnd) {
+        PostMessage(monitor->thread_hwnd, WM_CLOSE, 0, 0);
+        WaitForSingleObject(monitor->thread, INFINITE);
+    }
+    CloseHandle(monitor->thread);
+    monitor->thread = NULL;
+
+    _hs_array_release(&monitor->events);
+    _hs_array_release(&monitor->thread_events);
+    _hs_array_release(&monitor->refresh_events);
+}
+
+static int process_arrival_event(hs_monitor *monitor, const char *key, hs_enumerate_func *f,
+                                 void *udata)
+{
+    DEVINST inst;
+    hs_device *dev = NULL;
+    CONFIGRET cret;
+    int r;
+
+    cret = CM_Locate_DevNodeA(&inst, (DEVINSTID)key, CM_LOCATE_DEVNODE_NORMAL);
+    if (cret != CR_SUCCESS) {
+        hs_log(HS_LOG_DEBUG, "Device node '%s' does not exist: 0x%lx", key, cret);
+        return 0;
+    }
+
+    r = process_win32_device(inst, &dev);
+    if (r <= 0)
+        return r;
+
+    r = _hs_match_helper_match(&monitor->match_helper, dev, &dev->match_udata);
+    if (r)
+        r = _hs_monitor_add(&monitor->devices, dev, f, udata);
+    hs_device_unref(dev);
+
+    return r;
+}
+
+int hs_monitor_refresh(hs_monitor *monitor, hs_enumerate_func *f, void *udata)
+{
+    assert(monitor);
+
+    unsigned int event_idx = 0;
+    int r;
+
+    if (!monitor->thread)
+        return 0;
+
+    if (!monitor->refresh_events.count) {
+        /* We don't want to keep the lock for too long, so move all device events to our
+           own array and let the background thread work and process Win32 events. */
+        EnterCriticalSection(&monitor->events_lock);
+        monitor->refresh_events = monitor->events;
+        memset(&monitor->events, 0, sizeof(monitor->events));
+        r = monitor->thread_ret;
+        monitor->thread_ret = 0;
+        LeaveCriticalSection(&monitor->events_lock);
+
+        if (r < 0)
+            goto cleanup;
+    }
+
+    for (; event_idx < monitor->refresh_events.count; event_idx++) {
+        struct event *event = &monitor->refresh_events.values[event_idx];
+
+        switch (event->type) {
+            case DEVICE_EVENT_ADDED: {
+                hs_log(HS_LOG_DEBUG, "Received arrival notification for device '%s'",
+                       event->device_key);
+                r = process_arrival_event(monitor, event->device_key, f, udata);
+                if (r)
+                    goto cleanup;
+            } break;
+
+            case DEVICE_EVENT_REMOVED: {
+                hs_log(HS_LOG_DEBUG, "Received removal notification for device '%s'",
+                       event->device_key);
+                _hs_monitor_remove(&monitor->devices, event->device_key, f, udata);
+            } break;
+        }
+    }
+
+    r = 0;
+cleanup:
+    /* If an error occurs, there may be unprocessed notifications. Keep them in
+       monitor->refresh_events for the next time this function is called. */
+    _hs_array_remove(&monitor->refresh_events, 0, event_idx);
+    EnterCriticalSection(&monitor->events_lock);
+    if (!monitor->refresh_events.count && !monitor->events.count)
+        ResetEvent(monitor->thread_event);
+    LeaveCriticalSection(&monitor->events_lock);
+    return r;
+}
+
+int hs_monitor_list(hs_monitor *monitor, hs_enumerate_func *f, void *udata)
+{
+    return _hs_monitor_list(&monitor->devices, f, udata);
+}
+
+#endif
+
 // monitor_darwin.c
 // ------------------------------------
 
@@ -5541,6 +6008,13 @@ static void fill_hid_properties(struct service_aggregate *agg, hs_device *dev)
                                            kCFNumberSInt16Type, &dev->u.hid.usage_page);
     success &= get_ioregistry_value_number(agg->dev_service, CFSTR("PrimaryUsage"),
                                            kCFNumberSInt16Type, &dev->u.hid.usage);
+
+    success &= get_ioregistry_value_number(agg->dev_service, CFSTR("MaxInputReportSize"),
+                                           kCFNumberSInt16Type, &dev->u.hid.max_input_len);
+    success &= get_ioregistry_value_number(agg->dev_service, CFSTR("MaxOutputReportSize"),
+                                           kCFNumberSInt16Type, &dev->u.hid.max_output_len);
+    success &= get_ioregistry_value_number(agg->dev_service, CFSTR("MaxFeatureReportSize"),
+                                           kCFNumberSInt16Type, &dev->u.hid.max_feature_len);
 
     if (!success)
         hs_log(HS_LOG_WARNING, "Invalid HID values for '%s", dev->path);
@@ -5954,6 +6428,26 @@ int hs_monitor_list(hs_monitor *monitor, hs_enumerate_func *f, void *udata)
     return _hs_monitor_list(&monitor->devices, f, udata);
 }
 
+#endif
+
+// platform.c
+// ------------------------------------
+
+// #include "common_priv.h"
+// #include "platform.h"
+
+int hs_adjust_timeout(int timeout, uint64_t start)
+{
+    if (timeout < 0)
+        return -1;
+
+    uint64_t now = hs_millis();
+
+    if (now > start + (uint64_t)timeout)
+        return 0;
+    return (int)(start + (uint64_t)timeout - now);
+}
+
 // platform_darwin.c
 // ------------------------------------
 
@@ -6067,1354 +6561,9 @@ uint32_t hs_darwin_version(void)
     return version;
 }
 
-// serial_posix.c
-// ------------------------------------
-
-// #include "common_priv.h"
-#include <poll.h>
-#include <sys/ioctl.h>
-#include <termios.h>
-#include <unistd.h>
-// #include "device_priv.h"
-// #include "platform.h"
-// #include "serial.h"
-
-int hs_serial_set_config(hs_port *port, const hs_serial_config *config)
-{
-    assert(port);
-    assert(config);
-
-    struct termios tio;
-    int modem_bits;
-    int r;
-
-    r = tcgetattr(port->u.file.fd, &tio);
-    if (r < 0)
-        return hs_error(HS_ERROR_SYSTEM, "Unable to get serial port settings from '%s': %s",
-                        port->path, strerror(errno));
-    r = ioctl(port->u.file.fd, TIOCMGET, &modem_bits);
-    if (r < 0)
-        return hs_error(HS_ERROR_SYSTEM, "Unable to get modem bits from '%s': %s",
-                        port->path, strerror(errno));
-
-    if (config->baudrate) {
-        speed_t std_baudrate;
-
-        switch (config->baudrate) {
-            case 110: { std_baudrate = B110; } break;
-            case 134: { std_baudrate = B134; } break;
-            case 150: { std_baudrate = B150; } break;
-            case 200: { std_baudrate = B200; } break;
-            case 300: { std_baudrate = B300; } break;
-            case 600: { std_baudrate = B600; } break;
-            case 1200: { std_baudrate = B1200; } break;
-            case 1800: { std_baudrate = B1800; } break;
-            case 2400: { std_baudrate = B2400; } break;
-            case 4800: { std_baudrate = B4800; } break;
-            case 9600: { std_baudrate = B9600; } break;
-            case 19200: { std_baudrate = B19200; } break;
-            case 38400: { std_baudrate = B38400; } break;
-            case 57600: { std_baudrate = B57600; } break;
-            case 115200: { std_baudrate = B115200; } break;
-            case 230400: { std_baudrate = B230400; } break;
-
-            default: {
-                return hs_error(HS_ERROR_SYSTEM, "Unsupported baud rate value: %u",
-                                config->baudrate);
-            } break;
-        }
-
-        cfsetispeed(&tio, std_baudrate);
-        cfsetospeed(&tio, std_baudrate);
-    }
-
-    if (config->databits) {
-        tio.c_cflag &= (unsigned int)~CSIZE;
-
-        switch (config->databits) {
-            case 5: { tio.c_cflag |= CS5; } break;
-            case 6: { tio.c_cflag |= CS6; } break;
-            case 7: { tio.c_cflag |= CS7; } break;
-            case 8: { tio.c_cflag |= CS8; } break;
-
-            default: {
-                return hs_error(HS_ERROR_SYSTEM, "Invalid data bits setting: %u",
-                                config->databits);
-            } break;
-        }
-    }
-
-    if (config->stopbits) {
-        tio.c_cflag &= (unsigned int)~CSTOPB;
-
-        switch (config->stopbits) {
-            case 1: {} break;
-            case 2: { tio.c_cflag |= CSTOPB; } break;
-
-            default: {
-                return hs_error(HS_ERROR_SYSTEM, "Invalid stop bits setting: %u",
-                                config->stopbits);
-            } break;
-        }
-    }
-
-    if (config->parity) {
-        tio.c_cflag &= (unsigned int)~(PARENB | PARODD);
-#ifdef CMSPAR
-        tio.c_cflag &= (unsigned int)~CMSPAR;
 #endif
 
-        switch (config->parity) {
-            case HS_SERIAL_CONFIG_PARITY_OFF: {} break;
-            case HS_SERIAL_CONFIG_PARITY_EVEN: { tio.c_cflag |= PARENB; } break;
-            case HS_SERIAL_CONFIG_PARITY_ODD: { tio.c_cflag |= PARENB | PARODD; } break;
-#ifdef CMSPAR
-            case HS_SERIAL_CONFIG_PARITY_SPACE: { tio.c_cflag |= PARENB | CMSPAR; } break;
-            case HS_SERIAL_CONFIG_PARITY_MARK: { tio.c_cflag |= PARENB | PARODD | CMSPAR; } break;
-#else
-
-            case HS_SERIAL_CONFIG_PARITY_MARK:
-            case HS_SERIAL_CONFIG_PARITY_SPACE: {
-                return hs_error(HS_ERROR_SYSTEM, "Mark/space parity is not supported");
-            } break;
-#endif
-            default: {
-                return hs_error(HS_ERROR_SYSTEM, "Invalid parity setting: %d", config->parity);
-            } break;
-        }
-    }
-
-    if (config->rts) {
-        tio.c_cflag &= (unsigned int)~CRTSCTS;
-        modem_bits &= ~TIOCM_RTS;
-
-        switch (config->rts) {
-            case HS_SERIAL_CONFIG_RTS_OFF: {} break;
-            case HS_SERIAL_CONFIG_RTS_ON: { modem_bits |= TIOCM_RTS; } break;
-            case HS_SERIAL_CONFIG_RTS_FLOW: { tio.c_cflag |= CRTSCTS; } break;
-
-            default: {
-                return hs_error(HS_ERROR_SYSTEM, "Invalid RTS setting: %d", config->rts);
-            } break;
-        }
-    }
-
-    switch (config->dtr) {
-        case 0: {} break;
-        case HS_SERIAL_CONFIG_DTR_OFF: { modem_bits &= ~TIOCM_DTR; } break;
-        case HS_SERIAL_CONFIG_DTR_ON: { modem_bits |= TIOCM_DTR; } break;
-
-        default: {
-            return hs_error(HS_ERROR_SYSTEM, "Invalid DTR setting: %d", config->dtr);
-        } break;
-    }
-
-    if (config->xonxoff) {
-        tio.c_iflag &= (unsigned int)~(IXON | IXOFF | IXANY);
-
-        switch (config->xonxoff) {
-            case HS_SERIAL_CONFIG_XONXOFF_OFF: {} break;
-            case HS_SERIAL_CONFIG_XONXOFF_IN: { tio.c_iflag |= IXOFF; } break;
-            case HS_SERIAL_CONFIG_XONXOFF_OUT: { tio.c_iflag |= IXON | IXANY; } break;
-            case HS_SERIAL_CONFIG_XONXOFF_INOUT: { tio.c_iflag |= IXOFF | IXON | IXANY; } break;
-
-            default: {
-                return hs_error(HS_ERROR_SYSTEM, "Invalid XON/XOFF setting: %d", config->xonxoff);
-            } break;
-        }
-    }
-
-    r = ioctl(port->u.file.fd, TIOCMSET, &modem_bits);
-    if (r < 0)
-        return hs_error(HS_ERROR_SYSTEM, "Unable to set modem bits of '%s': %s",
-                        port->path, strerror(errno));
-    r = tcsetattr(port->u.file.fd, TCSANOW, &tio);
-    if (r < 0)
-        return hs_error(HS_ERROR_SYSTEM, "Unable to change serial port settings of '%s': %s",
-                        port->path, strerror(errno));
-
-    return 0;
-}
-
-int hs_serial_get_config(hs_port *port, hs_serial_config *config)
-{
-    assert(port);
-
-    struct termios tio;
-    int modem_bits;
-    int r;
-
-    r = tcgetattr(port->u.file.fd, &tio);
-    if (r < 0)
-        return hs_error(HS_ERROR_SYSTEM, "Unable to read port settings from '%s': %s",
-                        port->path, strerror(errno));
-    r = ioctl(port->u.file.fd, TIOCMGET, &modem_bits);
-    if (r < 0)
-        return hs_error(HS_ERROR_SYSTEM, "Unable to get modem bits from '%s': %s",
-                        port->path, strerror(errno));
-
-    /* 0 is the INVALID value for all parameters, we keep that value if we can't interpret
-       a termios value (only a cross-platform subset of it is exposed in hs_serial_config). */
-    memset(config, 0, sizeof(*config));
-
-    switch (cfgetispeed(&tio)) {
-        case B110: { config->baudrate = 110; } break;
-        case B134: { config->baudrate = 134; } break;
-        case B150: { config->baudrate = 150; } break;
-        case B200: { config->baudrate = 200; } break;
-        case B300: { config->baudrate = 300; } break;
-        case B600: { config->baudrate = 600; } break;
-        case B1200: { config->baudrate = 1200; } break;
-        case B1800: { config->baudrate = 1800; } break;
-        case B2400: { config->baudrate = 2400; } break;
-        case B4800: { config->baudrate = 4800; } break;
-        case B9600: { config->baudrate = 9600; } break;
-        case B19200: { config->baudrate = 19200; } break;
-        case B38400: { config->baudrate = 38400; } break;
-        case B57600: { config->baudrate = 57600; } break;
-        case B115200: { config->baudrate = 115200; } break;
-        case B230400: { config->baudrate = 230400; } break;
-    }
-
-    switch (tio.c_cflag & CSIZE) {
-        case CS5: { config->databits = 5; } break;
-        case CS6: { config->databits = 6; } break;
-        case CS7: { config->databits = 7; } break;
-        case CS8: { config->databits = 8; } break;
-    }
-
-    if (tio.c_cflag & CSTOPB) {
-        config->stopbits = 2;
-    } else {
-        config->stopbits = 1;
-    }
-
-    // FIXME: should we detect IGNPAR here?
-    if (tio.c_cflag & PARENB) {
-#ifdef CMSPAR
-        switch (tio.c_cflag & (PARODD | CMSPAR)) {
-#else
-        switch (tio.c_cflag & PARODD) {
-#endif
-            case 0: { config->parity = HS_SERIAL_CONFIG_PARITY_EVEN; } break;
-            case PARODD: { config->parity = HS_SERIAL_CONFIG_PARITY_ODD; } break;
-#ifdef CMSPAR
-            case CMSPAR: { config->parity = HS_SERIAL_CONFIG_PARITY_SPACE; } break;
-            case CMSPAR | PARODD: { config->parity = HS_SERIAL_CONFIG_PARITY_MARK; } break;
-#endif
-        }
-    } else {
-        config->parity = HS_SERIAL_CONFIG_PARITY_OFF;
-    }
-
-    if (tio.c_cflag & CRTSCTS) {
-        config->rts = HS_SERIAL_CONFIG_RTS_FLOW;
-    } else if (modem_bits & TIOCM_RTS) {
-        config->rts = HS_SERIAL_CONFIG_RTS_ON;
-    } else {
-        config->rts = HS_SERIAL_CONFIG_RTS_OFF;
-    }
-
-    if (modem_bits & TIOCM_DTR) {
-        config->dtr = HS_SERIAL_CONFIG_DTR_ON;
-    } else {
-        config->dtr = HS_SERIAL_CONFIG_DTR_OFF;
-    }
-
-    switch (tio.c_iflag & (IXON | IXOFF)) {
-        case 0: { config->xonxoff = HS_SERIAL_CONFIG_XONXOFF_OFF; } break;
-        case IXOFF: { config->xonxoff = HS_SERIAL_CONFIG_XONXOFF_IN; } break;
-        case IXON: { config->xonxoff = HS_SERIAL_CONFIG_XONXOFF_OUT; } break;
-        case IXOFF | IXON: { config->xonxoff = HS_SERIAL_CONFIG_XONXOFF_INOUT; } break;
-    }
-
-    return 0;
-}
-
-ssize_t hs_serial_read(hs_port *port, uint8_t *buf, size_t size, int timeout)
-{
-    assert(port);
-    assert(port->type == HS_DEVICE_TYPE_SERIAL);
-    assert(port->mode & HS_PORT_MODE_READ);
-    assert(buf);
-    assert(size);
-
-    ssize_t r;
-
-    if (timeout) {
-        struct pollfd pfd;
-        uint64_t start;
-
-        pfd.events = POLLIN;
-        pfd.fd = port->u.file.fd;
-
-        start = hs_millis();
-restart:
-        r = poll(&pfd, 1, hs_adjust_timeout(timeout, start));
-        if (r < 0) {
-            if (errno == EINTR)
-                goto restart;
-
-            return hs_error(HS_ERROR_IO, "I/O error while reading from '%s': %s", port->path,
-                            strerror(errno));
-        }
-        if (!r)
-            return 0;
-    }
-
-    r = read(port->u.file.fd, buf, size);
-    if (r < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
-            return 0;
-
-        return hs_error(HS_ERROR_IO, "I/O error while reading from '%s': %s", port->path,
-                        strerror(errno));
-    }
-
-    return r;
-}
-
-ssize_t hs_serial_write(hs_port *port, const uint8_t *buf, size_t size, int timeout)
-{
-    assert(port);
-    assert(port->type == HS_DEVICE_TYPE_SERIAL);
-    assert(port->mode & HS_PORT_MODE_WRITE);
-    assert(buf);
-
-    struct pollfd pfd;
-    uint64_t start;
-    int adjusted_timeout;
-    size_t written;
-
-    pfd.events = POLLOUT;
-    pfd.fd = port->u.file.fd;
-
-    start = hs_millis();
-    adjusted_timeout = timeout;
-
-    written = 0;
-    do {
-        ssize_t r;
-
-        r = poll(&pfd, 1, adjusted_timeout);
-        if (r < 0) {
-            if (errno == EINTR)
-                continue;
-
-            return hs_error(HS_ERROR_IO, "I/O error while writing to '%s': %s", port->path,
-                            strerror(errno));
-        }
-        if (!r)
-            break;
-
-        r = write(port->u.file.fd, buf + written, size - written);
-        if (r < 0) {
-            if (errno == EINTR)
-                continue;
-
-            return hs_error(HS_ERROR_IO, "I/O error while writing to '%s': %s", port->path,
-                            strerror(errno));
-        }
-        written += (size_t)r;
-
-        adjusted_timeout = hs_adjust_timeout(timeout, start);
-    } while (written < size && adjusted_timeout);
-
-    return (ssize_t)written;
-}
-
-    #elif defined(__linux__)
-// device_posix.c
-// ------------------------------------
-
-// #include "common_priv.h"
-#include <fcntl.h>
-#include <termios.h>
-#include <sys/ioctl.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <unistd.h>
-// #include "device_priv.h"
-// #include "platform.h"
-
-int _hs_open_file_port(hs_device *dev, hs_port_mode mode, hs_port **rport)
-{
-    hs_port *port;
-#ifdef __APPLE__
-    unsigned int retry = 4;
-#endif
-    int fd_flags;
-    int r;
-
-    port = (hs_port *)calloc(1, sizeof(*port));
-    if (!port) {
-        r = hs_error(HS_ERROR_MEMORY, NULL);
-        goto error;
-    }
-    port->type = dev->type;
-    port->u.file.fd = -1;
-
-    port->mode = mode;
-    port->path = dev->path;
-    port->dev = hs_device_ref(dev);
-
-    fd_flags = O_CLOEXEC | O_NOCTTY | O_NONBLOCK;
-    switch (mode) {
-        case HS_PORT_MODE_READ: { fd_flags |= O_RDONLY; } break;
-        case HS_PORT_MODE_WRITE: { fd_flags |= O_WRONLY; } break;
-        case HS_PORT_MODE_RW: { fd_flags |= O_RDWR; } break;
-    }
-
-restart:
-    port->u.file.fd = open(dev->path, fd_flags);
-    if (port->u.file.fd < 0) {
-        switch (errno) {
-            case EINTR: {
-                goto restart;
-            } break;
-
-            case EACCES: {
-                r = hs_error(HS_ERROR_ACCESS, "Permission denied for device '%s'", dev->path);
-            } break;
-            case EIO:
-            case ENXIO:
-            case ENODEV: {
-                r = hs_error(HS_ERROR_IO, "I/O error while opening device '%s'", dev->path);
-            } break;
-            case ENOENT:
-            case ENOTDIR: {
-                r = hs_error(HS_ERROR_NOT_FOUND, "Device '%s' not found", dev->path);
-            } break;
-
-#ifdef __APPLE__
-            /* On El Capitan (and maybe before), the open fails for some time (around 40 - 50 ms
-               on my computer) after the device notification. */
-            case EBUSY: {
-                if (retry--) {
-                    usleep(20000);
-                    goto restart;
-                }
-            } // fallthrough
-#endif
-
-            default: {
-                r = hs_error(HS_ERROR_SYSTEM, "open('%s') failed: %s", dev->path, strerror(errno));
-            } break;
-        }
-        goto error;
-    }
-
-    if (dev->type == HS_DEVICE_TYPE_SERIAL) {
-        struct termios tio;
-        int modem_bits;
-
-        r = tcgetattr(port->u.file.fd, &tio);
-        if (r < 0) {
-            r = hs_error(HS_ERROR_SYSTEM, "tcgetattr() failed on '%s': %s", dev->path,
-                         strerror(errno));
-            goto error;
-        }
-
-        /* Use raw I/O and sane settings, set DTR by default even on platforms that don't
-           enforce that. */
-        cfmakeraw(&tio);
-        tio.c_cc[VMIN] = 0;
-        tio.c_cc[VTIME] = 0;
-        tio.c_cflag |= CLOCAL | CREAD | HUPCL;
-        modem_bits = TIOCM_DTR;
-
-        r = tcsetattr(port->u.file.fd, TCSANOW, &tio);
-        if (r < 0) {
-            r = hs_error(HS_ERROR_SYSTEM, "tcsetattr() failed on '%s': %s", dev->path,
-                         strerror(errno));
-            goto error;
-        }
-        r = ioctl(port->u.file.fd, TIOCMBIS, &modem_bits);
-        if (r < 0) {
-            r = hs_error(HS_ERROR_SYSTEM, "ioctl(TIOCMBIS, TIOCM_DTR) failed on '%s': %s",
-                         dev->path, strerror(errno));
-            goto error;
-        }
-        r = tcflush(port->u.file.fd, TCIFLUSH);
-        if (r < 0) {
-            r = hs_error(HS_ERROR_SYSTEM, "tcflush(TCIFLUSH) failed on '%s': %s",
-                         dev->path, strerror(errno));
-            goto error;
-        }
-    }
-#ifdef __linux__
-    else if (dev->type == HS_DEVICE_TYPE_HID) {
-        port->u.file.numbered_hid_reports = dev->u.hid.numbered_reports;
-    }
-#endif
-
-    *rport = port;
-    return 0;
-
-error:
-    hs_port_close(port);
-    return r;
-}
-
-void _hs_close_file_port(hs_port *port)
-{
-    if (port) {
-#ifdef __linux__
-        // Only used for hidraw to work around a bug on old kernels
-        free(port->u.file.read_buf);
-#endif
-
-        close(port->u.file.fd);
-        hs_device_unref(port->dev);
-    }
-
-    free(port);
-}
-
-hs_handle _hs_get_file_port_poll_handle(const hs_port *port)
-{
-    return port->u.file.fd;
-}
-
-// hid_linux.c
-// ------------------------------------
-
-// #include "common_priv.h"
-#include <fcntl.h>
-#include <linux/hidraw.h>
-#include <poll.h>
-#include <sys/ioctl.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
-// #include "device_priv.h"
-// #include "hid.h"
-// #include "platform.h"
-
-static bool detect_kernel26_byte_bug()
-{
-    static bool init, bug;
-
-    if (!init) {
-        bug = hs_linux_version() >= 20628000 && hs_linux_version() < 20634000;
-        init = true;
-    }
-
-    return bug;
-}
-
-ssize_t hs_hid_read(hs_port *port, uint8_t *buf, size_t size, int timeout)
-{
-    assert(port);
-    assert(port->type == HS_DEVICE_TYPE_HID);
-    assert(port->mode & HS_PORT_MODE_READ);
-    assert(buf);
-    assert(size);
-
-    ssize_t r;
-
-    if (timeout) {
-        struct pollfd pfd;
-        uint64_t start;
-
-        pfd.events = POLLIN;
-        pfd.fd = port->u.file.fd;
-
-        start = hs_millis();
-restart:
-        r = poll(&pfd, 1, hs_adjust_timeout(timeout, start));
-        if (r < 0) {
-            if (errno == EINTR)
-                goto restart;
-
-            return hs_error(HS_ERROR_IO, "I/O error while reading from '%s': %s", port->path,
-                            strerror(errno));
-        }
-        if (!r)
-            return 0;
-    }
-
-    if (port->u.file.numbered_hid_reports) {
-        /* Work around a hidraw bug introduced in Linux 2.6.28 and fixed in Linux 2.6.34, see
-           https://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/commit/?id=5a38f2c7c4dd53d5be097930902c108e362584a3 */
-        if (detect_kernel26_byte_bug()) {
-            if (size + 1 > port->u.file.read_buf_size) {
-                free(port->u.file.read_buf);
-                port->u.file.read_buf_size = 0;
-
-                port->u.file.read_buf = (uint8_t *)malloc(size + 1);
-                if (!port->u.file.read_buf)
-                    return hs_error(HS_ERROR_MEMORY, NULL);
-                port->u.file.read_buf_size = size + 1;
-            }
-
-            r = read(port->u.file.fd, port->u.file.read_buf, size + 1);
-            if (r > 0)
-                memcpy(buf, port->u.file.read_buf + 1, (size_t)--r);
-        } else {
-            r = read(port->u.file.fd, buf, size);
-        }
-    } else {
-        r = read(port->u.file.fd, buf + 1, size - 1);
-        if (r > 0) {
-            buf[0] = 0;
-            r++;
-        }
-    }
-    if (r < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
-            return 0;
-
-        return hs_error(HS_ERROR_IO, "I/O error while reading from '%s': %s", port->path,
-                        strerror(errno));
-    }
-
-    return r;
-}
-
-ssize_t hs_hid_write(hs_port *port, const uint8_t *buf, size_t size)
-{
-    assert(port);
-    assert(port->type == HS_DEVICE_TYPE_HID);
-    assert(port->mode & HS_PORT_MODE_WRITE);
-    assert(buf);
-
-    if (size < 2)
-        return 0;
-
-    ssize_t r;
-
-restart:
-    // On linux, USB requests timeout after 5000ms and O_NONBLOCK isn't honoured for write
-    r = write(port->u.file.fd, (const char *)buf, size);
-    if (r < 0) {
-        if (errno == EINTR)
-            goto restart;
-
-        return hs_error(HS_ERROR_IO, "I/O error while writing to '%s': %s", port->path,
-                        strerror(errno));
-    }
-
-    return r;
-}
-
-ssize_t hs_hid_get_feature_report(hs_port *port, uint8_t report_id, uint8_t *buf, size_t size)
-{
-    assert(port);
-    assert(port->type == HS_DEVICE_TYPE_HID);
-    assert(port->mode & HS_PORT_MODE_READ);
-    assert(buf);
-    assert(size);
-
-    ssize_t r;
-
-    if (size >= 2)
-        buf[1] = report_id;
-
-restart:
-    r = ioctl(port->u.file.fd, HIDIOCGFEATURE(size - 1), (const char *)buf + 1);
-    if (r < 0) {
-        if (errno == EINTR)
-            goto restart;
-
-        return hs_error(HS_ERROR_IO, "I/O error while reading from '%s': %s", port->path,
-                        strerror(errno));
-    }
-
-    buf[0] = report_id;
-    return r + 1;
-}
-
-ssize_t hs_hid_send_feature_report(hs_port *port, const uint8_t *buf, size_t size)
-{
-    assert(port);
-    assert(port->type == HS_DEVICE_TYPE_HID);
-    assert(port->mode & HS_PORT_MODE_WRITE);
-    assert(buf);
-
-    if (size < 2)
-        return 0;
-
-    ssize_t r;
-
-restart:
-    r = ioctl(port->u.file.fd, HIDIOCSFEATURE(size), (const char *)buf);
-    if (r < 0) {
-        if (errno == EINTR)
-            goto restart;
-
-        return hs_error(HS_ERROR_IO, "I/O error while writing to '%s': %s", port->path,
-                        strerror(errno));
-    }
-
-    return r;
-}
-
-// monitor_linux.c
-// ------------------------------------
-
-// #include "common_priv.h"
-#include <fcntl.h>
-#include <linux/hidraw.h>
-#include <libudev.h>
-#include <pthread.h>
-#include <sys/eventfd.h>
-#include <sys/ioctl.h>
-#include <unistd.h>
-// #include "device_priv.h"
-// #include "match_priv.h"
-// #include "monitor_priv.h"
-// #include "platform.h"
-
-struct hs_monitor {
-    _hs_match_helper match_helper;
-    _hs_htable devices;
-
-    struct udev_monitor *udev_mon;
-    int wait_fd;
-};
-
-struct device_subsystem {
-    const char *subsystem;
-    hs_device_type type;
-};
-
-struct udev_aggregate {
-    struct udev_device *dev;
-    struct udev_device *usb;
-    struct udev_device *iface;
-};
-
-static struct device_subsystem device_subsystems[] = {
-    {"hidraw", HS_DEVICE_TYPE_HID},
-    {"tty",    HS_DEVICE_TYPE_SERIAL},
-    {NULL}
-};
-
-static pthread_mutex_t udev_init_lock = PTHREAD_MUTEX_INITIALIZER;
-static struct udev *udev;
-static int common_eventfd = -1;
-
-#ifndef _GNU_SOURCE
-int dup3(int oldfd, int newfd, int flags);
-#endif
-
-static int compute_device_location(struct udev_device *dev, char **rlocation)
-{
-    const char *busnum, *devpath;
-    char *location;
-    int r;
-
-    busnum = udev_device_get_sysattr_value(dev, "busnum");
-    devpath = udev_device_get_sysattr_value(dev, "devpath");
-
-    if (!busnum || !devpath)
-        return 0;
-
-    r = _hs_asprintf(&location, "usb-%s-%s", busnum, devpath);
-    if (r < 0)
-        return hs_error(HS_ERROR_MEMORY, NULL);
-
-    for (char *ptr = location; *ptr; ptr++) {
-        if (*ptr == '.')
-            *ptr = '-';
-    }
-
-    *rlocation = location;
-    return 1;
-}
-
-static int fill_device_details(struct udev_aggregate *agg, hs_device *dev)
-{
-    const char *buf;
-    int r;
-
-    buf = udev_device_get_subsystem(agg->dev);
-    if (!buf)
-        return 0;
-
-    if (strcmp(buf, "hidraw") == 0) {
-        dev->type = HS_DEVICE_TYPE_HID;
-    } else if (strcmp(buf, "tty") == 0) {
-        dev->type = HS_DEVICE_TYPE_SERIAL;
-    } else {
-        return 0;
-    }
-
-    buf = udev_device_get_devnode(agg->dev);
-    if (!buf || access(buf, F_OK) != 0)
-        return 0;
-    dev->path = strdup(buf);
-    if (!dev->path)
-        return hs_error(HS_ERROR_MEMORY, NULL);
-
-    dev->key = strdup(udev_device_get_devpath(agg->dev));
-    if (!dev->key)
-        return hs_error(HS_ERROR_MEMORY, NULL);
-
-    r = compute_device_location(agg->usb, &dev->location);
-    if (r <= 0)
-        return r;
-
-#define READ_UINT16_ATTRIBUTE(name, ptr) \
-        do { \
-            errno = 0; \
-            buf = udev_device_get_sysattr_value(agg->usb, (name)); \
-            if (!buf) \
-                return 0; \
-            *(ptr) = (uint16_t)strtoul(buf, NULL, 16); \
-            if (errno) \
-                return 0; \
-        } while (false)
-#define READ_STR_ATTRIBUTE(name, ptr) \
-        do { \
-            buf = udev_device_get_sysattr_value(agg->usb, (name)); \
-            if (buf) { \
-                *(ptr) = strdup(buf); \
-                if (!*(ptr)) \
-                    return hs_error(HS_ERROR_MEMORY, NULL); \
-            } \
-        } while (false)
-
-    READ_UINT16_ATTRIBUTE("idVendor", &dev->vid);
-    READ_UINT16_ATTRIBUTE("idProduct", &dev->pid);
-    READ_UINT16_ATTRIBUTE("bcdDevice", &dev->bcd_device);
-    READ_STR_ATTRIBUTE("manufacturer", &dev->manufacturer_string);
-    READ_STR_ATTRIBUTE("product", &dev->product_string);
-    READ_STR_ATTRIBUTE("serial", &dev->serial_number_string);
-
-#undef READ_STR_ATTRIBUTE
-#undef READ_UINT16_ATTRIBUTE
-
-    errno = 0;
-    buf = udev_device_get_devpath(agg->iface);
-    buf += strlen(buf) - 1;
-    dev->iface_number = (uint8_t)strtoul(buf, NULL, 10);
-    if (errno)
-        return 0;
-
-    return 1;
-}
-
-static size_t read_hid_descriptor_sysfs(struct udev_aggregate *agg, uint8_t *desc_buf,
-                                        size_t desc_buf_size)
-{
-    struct udev_device *hid_dev;
-    char report_path[4096];
-    int fd;
-    ssize_t r;
-
-    hid_dev = udev_device_get_parent_with_subsystem_devtype(agg->dev, "hid", NULL);
-    if (!hid_dev)
-        return 0;
-    snprintf(report_path, sizeof(report_path), "%s/report_descriptor",
-             udev_device_get_syspath(hid_dev));
-
-    fd = open(report_path, O_RDONLY);
-    if (fd < 0)
-        return 0;
-    r = read(fd, desc_buf, desc_buf_size);
-    close(fd);
-    if (r < 0)
-        return 0;
-
-    return (size_t)r;
-}
-
-static size_t read_hid_descriptor_hidraw(struct udev_aggregate *agg, uint8_t *desc_buf,
-                                         size_t desc_buf_size)
-{
-    const char *node_path;
-    int fd = -1;
-    int hidraw_desc_size = 0;
-    struct hidraw_report_descriptor hidraw_desc;
-    int r;
-
-    node_path = udev_device_get_devnode(agg->dev);
-    if (!node_path)
-        goto cleanup;
-    fd = open(node_path, O_RDONLY);
-    if (fd < 0)
-        goto cleanup;
-
-    r = ioctl(fd, HIDIOCGRDESCSIZE, &hidraw_desc_size);
-    if (r < 0)
-        goto cleanup;
-    hidraw_desc.size = (uint32_t)hidraw_desc_size;
-    r = ioctl(fd, HIDIOCGRDESC, &hidraw_desc);
-    if (r < 0) {
-        hidraw_desc_size = 0;
-        goto cleanup;
-    }
-
-    if (desc_buf_size > hidraw_desc.size)
-        desc_buf_size = hidraw_desc.size;
-    memcpy(desc_buf, hidraw_desc.value, desc_buf_size);
-
-cleanup:
-    close(fd);
-    return (size_t)hidraw_desc_size;
-}
-
-static void parse_hid_descriptor(hs_device *dev, uint8_t *desc, size_t desc_size)
-{
-    unsigned int collection_depth = 0;
-
-    unsigned int item_size = 0;
-    for (size_t i = 0; i < desc_size; i += item_size + 1) {
-        unsigned int item_type;
-        uint32_t item_data;
-
-        item_type = desc[i];
-
-        if (item_type == 0xFE) {
-            // not interested in long items
-            if (i + 1 < desc_size)
-                item_size = (unsigned int)desc[i + 1] + 2;
-            continue;
-        }
-
-        item_size = item_type & 3;
-        if (item_size == 3)
-            item_size = 4;
-        item_type &= 0xFC;
-
-        if (i + item_size >= desc_size) {
-            hs_log(HS_LOG_WARNING, "Invalid HID descriptor for device '%s'", dev->path);
-            return;
-        }
-
-        // little endian
-        switch (item_size) {
-            case 0: {
-                item_data = 0;
-            } break;
-            case 1: {
-                item_data = desc[i + 1];
-            } break;
-            case 2: {
-                item_data = (uint32_t)(desc[i + 2] << 8) | desc[i + 1];
-            } break;
-            case 4: {
-                item_data = (uint32_t)((desc[i + 4] << 24) | (desc[i + 3] << 16) |
-                                       (desc[i + 2] << 8) | desc[i + 1]);
-            } break;
-
-            // silence unitialized warning
-            default: {
-                item_data = 0;
-            } break;
-        }
-
-        switch (item_type) {
-            // main items
-            case 0xA0: {
-                collection_depth++;
-            } break;
-            case 0xC0: {
-                collection_depth--;
-            } break;
-
-            // global items
-            case 0x84: {
-                dev->u.hid.numbered_reports = true;
-            } break;
-            case 0x04: {
-                if (!collection_depth)
-                    dev->u.hid.usage_page = (uint16_t)item_data;
-            } break;
-
-            // local items
-            case 0x08: {
-                if (!collection_depth)
-                    dev->u.hid.usage = (uint16_t)item_data;
-            } break;
-        }
-    }
-}
-
-static void fill_hid_properties(struct udev_aggregate *agg, hs_device *dev)
-{
-    uint8_t desc[HID_MAX_DESCRIPTOR_SIZE];
-    size_t desc_size;
-
-    // The sysfs report_descriptor file appeared in 2011, somewhere around Linux 2.6.38
-    desc_size = read_hid_descriptor_sysfs(agg, desc, sizeof(desc));
-    if (!desc_size) {
-        desc_size = read_hid_descriptor_hidraw(agg, desc, sizeof(desc));
-        if (!desc_size) {
-            // This will happen pretty often on old kernels, most HID nodes are root-only
-            hs_log(HS_LOG_DEBUG, "Cannot get HID report descriptor from '%s'", dev->path);
-            return;
-        }
-    }
-
-    parse_hid_descriptor(dev, desc, desc_size);
-}
-
-static int read_device_information(struct udev_device *udev_dev, hs_device **rdev)
-{
-    struct udev_aggregate agg;
-    hs_device *dev = NULL;
-    int r;
-
-    agg.dev = udev_dev;
-    agg.usb = udev_device_get_parent_with_subsystem_devtype(agg.dev, "usb", "usb_device");
-    agg.iface = udev_device_get_parent_with_subsystem_devtype(agg.dev, "usb", "usb_interface");
-    if (!agg.usb || !agg.iface) {
-        r = 0;
-        goto cleanup;
-    }
-
-    dev = (hs_device *)calloc(1, sizeof(*dev));
-    if (!dev) {
-        r = hs_error(HS_ERROR_MEMORY, NULL);
-        goto cleanup;
-    }
-    dev->refcount = 1;
-    dev->status = HS_DEVICE_STATUS_ONLINE;
-
-    r = fill_device_details(&agg, dev);
-    if (r <= 0)
-        goto cleanup;
-
-    if (dev->type == HS_DEVICE_TYPE_HID)
-        fill_hid_properties(&agg, dev);
-
-    *rdev = dev;
-    dev = NULL;
-
-    r = 1;
-cleanup:
-    hs_device_unref(dev);
-    return r;
-}
-
-static void release_udev(void)
-{
-    close(common_eventfd);
-    udev_unref(udev);
-    pthread_mutex_destroy(&udev_init_lock);
-}
-
-static int init_udev(void)
-{
-    static bool atexit_called;
-    int r;
-
-    // fast path
-    if (udev && common_eventfd >= 0)
-        return 0;
-
-    pthread_mutex_lock(&udev_init_lock);
-
-    if (!atexit_called) {
-        atexit(release_udev);
-        atexit_called = true;
-    }
-
-    if (!udev) {
-        udev = udev_new();
-        if (!udev) {
-            r = hs_error(HS_ERROR_SYSTEM, "udev_new() failed");
-            goto cleanup;
-        }
-    }
-
-    if (common_eventfd < 0) {
-        /* We use this as a never-ready placeholder descriptor for all newly created monitors,
-           until hs_monitor_start() creates the udev monitor and its socket. */
-        common_eventfd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-        if (common_eventfd < 0) {
-            r = hs_error(HS_ERROR_SYSTEM, "eventfd() failed: %s", strerror(errno));
-            goto cleanup;
-        }
-    }
-
-    r = 0;
-cleanup:
-    pthread_mutex_unlock(&udev_init_lock);
-    return r;
-}
-
-static int enumerate(_hs_match_helper *match_helper, hs_enumerate_func *f, void *udata)
-{
-    struct udev_enumerate *enumerate;
-    int r;
-
-    enumerate = udev_enumerate_new(udev);
-    if (!enumerate) {
-        r = hs_error(HS_ERROR_MEMORY, NULL);
-        goto cleanup;
-    }
-
-    udev_enumerate_add_match_is_initialized(enumerate);
-    for (unsigned int i = 0; device_subsystems[i].subsystem; i++) {
-        if (_hs_match_helper_has_type(match_helper, device_subsystems[i].type)) {
-            r = udev_enumerate_add_match_subsystem(enumerate, device_subsystems[i].subsystem);
-            if (r < 0) {
-                r = hs_error(HS_ERROR_MEMORY, NULL);
-                goto cleanup;
-            }
-        }
-    }
-
-    // Current implementation of udev_enumerate_scan_devices() does not fail
-    r = udev_enumerate_scan_devices(enumerate);
-    if (r < 0) {
-        r = hs_error(HS_ERROR_SYSTEM, "udev_enumerate_scan_devices() failed");
-        goto cleanup;
-    }
-
-    struct udev_list_entry *cur;
-    udev_list_entry_foreach(cur, udev_enumerate_get_list_entry(enumerate)) {
-        struct udev_device *udev_dev;
-        hs_device *dev;
-
-        udev_dev = udev_device_new_from_syspath(udev, udev_list_entry_get_name(cur));
-        if (!udev_dev) {
-            if (errno == ENOMEM) {
-                r = hs_error(HS_ERROR_MEMORY, NULL);
-                goto cleanup;
-            }
-            continue;
-        }
-
-        r = read_device_information(udev_dev, &dev);
-        udev_device_unref(udev_dev);
-        if (r < 0)
-            goto cleanup;
-        if (!r)
-            continue;
-
-        if (_hs_match_helper_match(match_helper, dev, &dev->match_udata)) {
-            r = (*f)(dev, udata);
-            hs_device_unref(dev);
-            if (r)
-                goto cleanup;
-        } else {
-            hs_device_unref(dev);
-        }
-    }
-
-    r = 0;
-cleanup:
-    udev_enumerate_unref(enumerate);
-    return r;
-}
-
-struct enumerate_enumerate_context {
-    hs_enumerate_func *f;
-    void *udata;
-};
-
-static int enumerate_enumerate_callback(hs_device *dev, void *udata)
-{
-    struct enumerate_enumerate_context *ctx = (struct enumerate_enumerate_context *)udata;
-
-    _hs_device_log(dev, "Enumerate");
-    return (*ctx->f)(dev, ctx->udata);
-}
-
-int hs_enumerate(const hs_match_spec *matches, unsigned int count, hs_enumerate_func *f,
-                 void *udata)
-{
-    assert(f);
-
-    _hs_match_helper match_helper = {0};
-    struct enumerate_enumerate_context ctx;
-    int r;
-
-    r = init_udev();
-    if (r < 0)
-        return r;
-
-    r = _hs_match_helper_init(&match_helper, matches, count);
-    if (r < 0)
-        return r;
-
-    ctx.f = f;
-    ctx.udata = udata;
-
-    r = enumerate(&match_helper, enumerate_enumerate_callback, &ctx);
-
-    _hs_match_helper_release(&match_helper);
-    return r;
-}
-
-int hs_monitor_new(const hs_match_spec *matches, unsigned int count, hs_monitor **rmonitor)
-{
-    assert(rmonitor);
-
-    hs_monitor *monitor;
-    int r;
-
-    monitor = (hs_monitor *)calloc(1, sizeof(*monitor));
-    if (!monitor) {
-        r = hs_error(HS_ERROR_MEMORY, NULL);
-        goto error;
-    }
-    monitor->wait_fd = -1;
-
-    r = _hs_match_helper_init(&monitor->match_helper, matches, count);
-    if (r < 0)
-        goto error;
-
-    r = _hs_htable_init(&monitor->devices, 64);
-    if (r < 0)
-        goto error;
-
-    r = init_udev();
-    if (r < 0)
-        goto error;
-
-    monitor->wait_fd = fcntl(common_eventfd, F_DUPFD_CLOEXEC, 0);
-    if (monitor->wait_fd < 0) {
-        r = hs_error(HS_ERROR_SYSTEM, "fcntl(F_DUPFD_CLOEXEC) failed: %s", strerror(errno));
-        goto error;
-    }
-
-    *rmonitor = monitor;
-    return 0;
-
-error:
-    hs_monitor_free(monitor);
-    return r;
-}
-
-void hs_monitor_free(hs_monitor *monitor)
-{
-    if (monitor) {
-        close(monitor->wait_fd);
-        udev_monitor_unref(monitor->udev_mon);
-
-        _hs_monitor_clear_devices(&monitor->devices);
-        _hs_htable_release(&monitor->devices);
-        _hs_match_helper_release(&monitor->match_helper);
-    }
-
-    free(monitor);
-}
-
-static int monitor_enumerate_callback(hs_device *dev, void *udata)
-{
-    hs_monitor *monitor = (hs_monitor *)udata;
-    return _hs_monitor_add(&monitor->devices, dev, NULL, NULL);
-}
-
-int hs_monitor_start(hs_monitor *monitor)
-{
-    assert(monitor);
-
-    int r;
-
-    if (monitor->udev_mon)
-        return 0;
-
-    monitor->udev_mon = udev_monitor_new_from_netlink(udev, "udev");
-    if (!monitor->udev_mon) {
-        r = hs_error(HS_ERROR_SYSTEM, "udev_monitor_new_from_netlink() failed");
-        goto error;
-    }
-
-    for (unsigned int i = 0; device_subsystems[i].subsystem; i++) {
-        if (_hs_match_helper_has_type(&monitor->match_helper, device_subsystems[i].type)) {
-            r = udev_monitor_filter_add_match_subsystem_devtype(monitor->udev_mon, device_subsystems[i].subsystem, NULL);
-            if (r < 0) {
-                r = hs_error(HS_ERROR_SYSTEM, "udev_monitor_filter_add_match_subsystem_devtype() failed");
-                goto error;
-            }
-        }
-    }
-
-    r = udev_monitor_enable_receiving(monitor->udev_mon);
-    if (r < 0) {
-        r = hs_error(HS_ERROR_SYSTEM, "udev_monitor_enable_receiving() failed");
-        goto error;
-    }
-
-    r = enumerate(&monitor->match_helper, monitor_enumerate_callback, monitor);
-    if (r < 0)
-        goto error;
-
-    /* Given the documentation of dup3() and the kernel code handling it, I'm reasonably sure
-       nothing can make this call fail. */
-    dup3(udev_monitor_get_fd(monitor->udev_mon), monitor->wait_fd, O_CLOEXEC);
-
-    return 0;
-
-error:
-    hs_monitor_stop(monitor);
-    return r;
-}
-
-void hs_monitor_stop(hs_monitor *monitor)
-{
-    assert(monitor);
-
-    if (!monitor->udev_mon)
-        return;
-
-    _hs_monitor_clear_devices(&monitor->devices);
-
-    dup3(common_eventfd, monitor->wait_fd, O_CLOEXEC);
-    udev_monitor_unref(monitor->udev_mon);
-    monitor->udev_mon = NULL;
-}
-
-hs_handle hs_monitor_get_poll_handle(const hs_monitor *monitor)
-{
-    assert(monitor);
-    return monitor->wait_fd;
-}
-
-int hs_monitor_refresh(hs_monitor *monitor, hs_enumerate_func *f, void *udata)
-{
-    assert(monitor);
-
-    struct udev_device *udev_dev;
-    int r;
-
-    if (!monitor->udev_mon)
-        return 0;
-
-    errno = 0;
-    while ((udev_dev = udev_monitor_receive_device(monitor->udev_mon))) {
-        const char *action = udev_device_get_action(udev_dev);
-
-        r = 0;
-        if (strcmp(action, "add") == 0) {
-            hs_device *dev = NULL;
-
-            r = read_device_information(udev_dev, &dev);
-            if (r > 0) {
-                r = _hs_match_helper_match(&monitor->match_helper, dev, &dev->match_udata);
-                if (r)
-                    r = _hs_monitor_add(&monitor->devices, dev, f, udata);
-            }
-
-            hs_device_unref(dev);
-        } else if (strcmp(action, "remove") == 0) {
-            _hs_monitor_remove(&monitor->devices, udev_device_get_devpath(udev_dev), f, udata);
-        }
-        udev_device_unref(udev_dev);
-        if (r)
-            return r;
-
-        errno = 0;
-    }
-    if (errno == ENOMEM)
-        return hs_error(HS_ERROR_MEMORY, NULL);
-
-    return 0;
-}
-
-int hs_monitor_list(hs_monitor *monitor, hs_enumerate_func *f, void *udata)
-{
-    return _hs_monitor_list(&monitor->devices, f, udata);
-}
-
-// platform_posix.c
+// platform_linux.c
 // ------------------------------------
 
 // #include "common_priv.h"
@@ -7492,7 +6641,6 @@ restart:
     return r;
 }
 
-#ifdef __linux__
 uint32_t hs_linux_version(void)
 {
     static uint32_t version;
@@ -7513,10 +6661,105 @@ uint32_t hs_linux_version(void)
 
     return version;
 }
+
+#endif
+
+// platform_win32.c
+// ------------------------------------
+
+// #include "common_priv.h"
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+// #include "platform.h"
+
+typedef LONG NTAPI RtlGetVersion_func(OSVERSIONINFOW *info);
+
+uint64_t hs_millis(void)
+{
+    return GetTickCount64();
+}
+
+void hs_delay(unsigned int ms)
+{
+    Sleep(ms);
+}
+
+int hs_poll(hs_poll_source *sources, unsigned int count, int timeout)
+{
+    assert(sources);
+    assert(count);
+    assert(count <= HS_POLL_MAX_SOURCES);
+
+    HANDLE handles[HS_POLL_MAX_SOURCES];
+
+    for (unsigned int i = 0; i < count; i++) {
+        handles[i] = sources[i].desc;
+        sources[i].ready = 0;
+    }
+
+    DWORD ret = WaitForMultipleObjects((DWORD)count, handles, FALSE,
+                                       timeout < 0 ? INFINITE : (DWORD)timeout);
+    if (ret == WAIT_FAILED)
+        return hs_error(HS_ERROR_SYSTEM, "WaitForMultipleObjects() failed: %s",
+                        hs_win32_strerror(0));
+
+    for (unsigned int i = 0; i < count; i++)
+        sources[i].ready = (i == ret);
+
+    return ret < count;
+}
+
+const char *hs_win32_strerror(DWORD err)
+{
+    static _HS_THREAD_LOCAL char buf[256];
+    char *ptr;
+    DWORD r;
+
+    if (!err)
+        err = GetLastError();
+
+    r = FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL,
+                       err, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), buf, sizeof(buf), NULL);
+
+    if (r) {
+        ptr = buf + strlen(buf);
+        // FormatMessage adds newlines, remove them
+        while (ptr > buf && (ptr[-1] == '\n' || ptr[-1] == '\r'))
+            ptr--;
+        *ptr = 0;
+    } else {
+        sprintf(buf, "Unknown error 0x%08lx", err);
+    }
+
+    return buf;
+}
+
+uint32_t hs_win32_version(void)
+{
+    static uint32_t version;
+
+    if (!version) {
+        OSVERSIONINFOW info;
+
+        // Windows 8.1 broke GetVersionEx, so bypass the intermediary
+        info.dwOSVersionInfoSize = sizeof(info);
+
+        RtlGetVersion_func *RtlGetVersion =
+            (RtlGetVersion_func *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlGetVersion");
+        RtlGetVersion(&info);
+
+        version = info.dwMajorVersion * 100 + info.dwMinorVersion;
+    }
+
+    return version;
+}
+
 #endif
 
 // serial_posix.c
 // ------------------------------------
+
+#ifndef _WIN32
 
 // #include "common_priv.h"
 #include <poll.h>
@@ -7871,7 +7114,303 @@ ssize_t hs_serial_write(hs_port *port, const uint8_t *buf, size_t size, int time
     return (ssize_t)written;
 }
 
-    #else
-        #error "Platform not supported"
-    #endif
+#endif
+
+// serial_win32.c
+// ------------------------------------
+
+// #include "common_priv.h"
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+// #include "device_priv.h"
+// #include "platform.h"
+// #include "serial.h"
+
+int hs_serial_set_config(hs_port *port, const hs_serial_config *config)
+{
+    assert(port);
+    assert(config);
+
+    DCB dcb;
+    BOOL success;
+
+    dcb.DCBlength = sizeof(dcb);
+    success = GetCommState(port->u.handle.h, &dcb);
+    if (!success)
+        return hs_error(HS_ERROR_SYSTEM, "GetCommState() failed on '%s': %s", port->dev->path,
+                        hs_win32_strerror(0));
+
+    switch (config->baudrate) {
+        case 0: {} break;
+
+        case 110:
+        case 134:
+        case 150:
+        case 200:
+        case 300:
+        case 600:
+        case 1200:
+        case 1800:
+        case 2400:
+        case 4800:
+        case 9600:
+        case 19200:
+        case 38400:
+        case 57600:
+        case 115200:
+        case 230400: {
+            dcb.BaudRate = config->baudrate;
+        } break;
+
+        default: {
+            return hs_error(HS_ERROR_SYSTEM, "Unsupported baud rate value: %u", config->baudrate);
+        } break;
+    }
+
+    switch (config->databits) {
+        case 0: {} break;
+
+        case 5:
+        case 6:
+        case 7:
+        case 8: {
+            dcb.ByteSize = (BYTE)config->databits;
+        } break;
+
+        default: {
+            return hs_error(HS_ERROR_SYSTEM, "Invalid data bits setting: %u", config->databits);
+        } break;
+    }
+
+    switch (config->stopbits) {
+        case 0: {} break;
+
+        case 1: { dcb.StopBits = ONESTOPBIT; } break;
+        case 2: { dcb.StopBits = TWOSTOPBITS; } break;
+
+        default: {
+            return hs_error(HS_ERROR_SYSTEM, "Invalid stop bits setting: %u", config->stopbits);
+        } break;
+    }
+
+    switch (config->parity) {
+        case 0: {} break;
+
+        case HS_SERIAL_CONFIG_PARITY_OFF: {
+            dcb.fParity = FALSE;
+            dcb.Parity = NOPARITY;
+        } break;
+        case HS_SERIAL_CONFIG_PARITY_EVEN: {
+            dcb.fParity = TRUE;
+            dcb.Parity = EVENPARITY;
+        } break;
+        case HS_SERIAL_CONFIG_PARITY_ODD: {
+            dcb.fParity = TRUE;
+            dcb.Parity = ODDPARITY;
+        } break;
+        case HS_SERIAL_CONFIG_PARITY_MARK: {
+            dcb.fParity = TRUE;
+            dcb.Parity = MARKPARITY;
+        } break;
+        case HS_SERIAL_CONFIG_PARITY_SPACE: {
+            dcb.fParity = TRUE;
+            dcb.Parity = SPACEPARITY;
+        } break;
+
+        default: {
+            return hs_error(HS_ERROR_SYSTEM, "Invalid parity setting: %d", config->parity);
+        } break;
+    }
+
+    switch (config->rts) {
+        case 0: {} break;
+
+        case HS_SERIAL_CONFIG_RTS_OFF: {
+            dcb.fRtsControl = RTS_CONTROL_DISABLE;
+            dcb.fOutxCtsFlow = FALSE;
+        } break;
+        case HS_SERIAL_CONFIG_RTS_ON: {
+            dcb.fRtsControl = RTS_CONTROL_ENABLE;
+            dcb.fOutxCtsFlow = FALSE;
+        } break;
+        case HS_SERIAL_CONFIG_RTS_FLOW: {
+            dcb.fRtsControl = RTS_CONTROL_HANDSHAKE;
+            dcb.fOutxCtsFlow = TRUE;
+        } break;
+
+        default: {
+            return hs_error(HS_ERROR_SYSTEM, "Invalid RTS setting: %d", config->rts);
+        } break;
+    }
+
+    switch (config->dtr) {
+        case 0: {} break;
+
+        case HS_SERIAL_CONFIG_DTR_OFF: {
+            dcb.fDtrControl = DTR_CONTROL_DISABLE;
+            dcb.fOutxDsrFlow = FALSE;
+        } break;
+        case HS_SERIAL_CONFIG_DTR_ON: {
+            dcb.fDtrControl = DTR_CONTROL_ENABLE;
+            dcb.fOutxDsrFlow = FALSE;
+        } break;
+
+        default: {
+            return hs_error(HS_ERROR_SYSTEM, "Invalid DTR setting: %d", config->dtr);
+        } break;
+    }
+
+    switch (config->xonxoff) {
+        case 0: {} break;
+
+        case HS_SERIAL_CONFIG_XONXOFF_OFF: {
+            dcb.fOutX = FALSE;
+            dcb.fInX = FALSE;
+        } break;
+        case HS_SERIAL_CONFIG_XONXOFF_IN: {
+            dcb.fOutX = FALSE;
+            dcb.fInX = TRUE;
+        } break;
+        case HS_SERIAL_CONFIG_XONXOFF_OUT: {
+            dcb.fOutX = TRUE;
+            dcb.fInX = FALSE;
+        } break;
+        case HS_SERIAL_CONFIG_XONXOFF_INOUT: {
+            dcb.fOutX = TRUE;
+            dcb.fInX = TRUE;
+        } break;
+
+        default: {
+            return hs_error(HS_ERROR_SYSTEM, "Invalid XON/XOFF setting: %d", config->xonxoff);
+        } break;
+    }
+
+    success = SetCommState(port->u.handle.h, &dcb);
+    if (!success)
+        return hs_error(HS_ERROR_SYSTEM, "SetCommState() failed on '%s': %s",
+                        port->dev->path, hs_win32_strerror(0));
+
+    return 0;
+}
+
+int hs_serial_get_config(hs_port *port, hs_serial_config *config)
+{
+    assert(port);
+    assert(config);
+
+    DCB dcb;
+    BOOL success;
+
+    dcb.DCBlength = sizeof(dcb);
+    success = GetCommState(port->u.handle.h, &dcb);
+    if (!success)
+        return hs_error(HS_ERROR_SYSTEM, "GetCommState() failed on '%s': %s", port->dev->path,
+                        hs_win32_strerror(0));
+
+    /* 0 is the INVALID value for all parameters, we keep that value if we can't interpret
+       a DCB setting (only a cross-platform subset of it is exposed in hs_serial_config). */
+    memset(config, 0, sizeof(*config));
+
+    config->baudrate = dcb.BaudRate;
+    config->databits = dcb.ByteSize;
+
+    // There is also ONE5STOPBITS, ignore it for now (and ever, probably)
+    switch (dcb.StopBits) {
+        case ONESTOPBIT: { config->stopbits = 1; } break;
+        case TWOSTOPBITS: { config->stopbits = 2; } break;
+    }
+
+    if (dcb.fParity) {
+        switch (dcb.Parity) {
+            case NOPARITY: { config->parity = HS_SERIAL_CONFIG_PARITY_OFF; } break;
+            case EVENPARITY: { config->parity = HS_SERIAL_CONFIG_PARITY_EVEN; } break;
+            case ODDPARITY: { config->parity = HS_SERIAL_CONFIG_PARITY_ODD; } break;
+            case MARKPARITY: { config->parity = HS_SERIAL_CONFIG_PARITY_MARK; } break;
+            case SPACEPARITY: { config->parity = HS_SERIAL_CONFIG_PARITY_SPACE; } break;
+        }
+    } else {
+        config->parity = HS_SERIAL_CONFIG_PARITY_OFF;
+    }
+
+    switch (dcb.fRtsControl) {
+        case RTS_CONTROL_DISABLE: { config->rts = HS_SERIAL_CONFIG_RTS_OFF; } break;
+        case RTS_CONTROL_ENABLE: { config->rts = HS_SERIAL_CONFIG_RTS_ON; } break;
+        case RTS_CONTROL_HANDSHAKE: { config->rts = HS_SERIAL_CONFIG_RTS_FLOW; } break;
+    }
+
+    switch (dcb.fDtrControl) {
+        case DTR_CONTROL_DISABLE: { config->dtr = HS_SERIAL_CONFIG_DTR_OFF; } break;
+        case DTR_CONTROL_ENABLE: { config->dtr = HS_SERIAL_CONFIG_DTR_ON; } break;
+    }
+
+    if (dcb.fInX && dcb.fOutX) {
+        config->xonxoff = HS_SERIAL_CONFIG_XONXOFF_INOUT;
+    } else if (dcb.fInX) {
+        config->xonxoff = HS_SERIAL_CONFIG_XONXOFF_IN;
+    } else if (dcb.fOutX) {
+        config->xonxoff = HS_SERIAL_CONFIG_XONXOFF_OUT;
+    } else {
+        config->xonxoff = HS_SERIAL_CONFIG_XONXOFF_OFF;
+    }
+
+    return 0;
+}
+
+ssize_t hs_serial_read(hs_port *port, uint8_t *buf, size_t size, int timeout)
+{
+    assert(port);
+    assert(port->dev->type == HS_DEVICE_TYPE_SERIAL);
+    assert(port->mode & HS_PORT_MODE_READ);
+    assert(buf);
+    assert(size);
+
+    if (port->u.handle.read_status < 0) {
+        // Could be a transient error, try to restart it
+        _hs_win32_start_async_read(port);
+        if (port->u.handle.read_status < 0)
+            return port->u.handle.read_status;
+    }
+
+    /* Serial devices are stream-based. If we don't have any data yet, see if our asynchronous
+       read request has returned anything. Then we can just give the user the data we have, until
+       our buffer is empty. We can't just discard stuff, unlike what we do for long HID messages. */
+    if (!port->u.handle.read_len) {
+        _hs_win32_finalize_async_read(port, timeout);
+        if (port->u.handle.read_status <= 0)
+            return port->u.handle.read_status;
+    }
+
+    if (size > port->u.handle.read_len)
+        size = port->u.handle.read_len;
+    memcpy(buf, port->u.handle.read_ptr, size);
+    port->u.handle.read_ptr += size;
+    port->u.handle.read_len -= size;
+
+    /* Our buffer has been fully read, start a new asynchonous request. I don't know how
+       much latency this brings. Maybe double buffering would help, but not before any concrete
+       benchmarking is done. */
+    if (!port->u.handle.read_len) {
+        hs_error_mask(HS_ERROR_IO);
+        _hs_win32_start_async_read(port);
+        hs_error_unmask();
+    }
+
+    return (ssize_t)size;
+}
+
+ssize_t hs_serial_write(hs_port *port, const uint8_t *buf, size_t size, int timeout)
+{
+    assert(port);
+    assert(port->dev->type == HS_DEVICE_TYPE_SERIAL);
+    assert(port->mode & HS_PORT_MODE_WRITE);
+    assert(buf);
+    
+    if (!size)
+        return 0;
+
+    return _hs_win32_write_sync(port, buf, size, timeout);
+}
+
+#endif
+
 #endif
